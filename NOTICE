@@ -1,0 +1,10 @@
+Windrose-CAN
+Copyright 2026 Windrose
+
+This product includes software developed by Windrose.
+
+No third-party code is bundled in this repository:
+- canbench.py uses only the Python 3.9 standard library.
+- canbench.js is a self-contained UMD module with no dependencies.
+
+No DBC file or vehicle signal database is included. Supply your own DBC.
