@@ -1,8 +1,8 @@
-# Windrose-CAN
+# Windrose Diagnose
 
-A read-only CAN / CAN FD diagnostic bench tool from Windrose.
+**Read-only CAN / CAN FD diagnostic tool from Windrose** — it listens and asks; it never writes to the vehicle.
 
-Windrose-CAN connects to a vehicle CAN bus to **read** — vehicle speed, fault
+Windrose Diagnose connects to a vehicle CAN bus to **read** — vehicle speed, fault
 codes, VIN, software and component identifiers — plots signals, and decodes a
 DBC that you supply. It is deliberately listen-and-ask only.
 
