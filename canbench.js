@@ -2,7 +2,8 @@
 // Copyright 2026 Windrose
 /* Local CAN bench for the Windrose read page. Same rules as canbench.py.
    A DBC stays in this browser. Outbound frames are read-only questions.
-   CAN adapter (Peak, ZLG, …). CAN XL is not implemented. CANBENCH_REV 2026-10-24.2 */
+   On open, name the dongle. You do not pick Peak or ZLG.
+   CAN XL is not implemented. CANBENCH_REV 2026-10-24.3 */
 (function (root, factory) {
   var api = factory();
   if (typeof module !== "undefined" && module.exports) module.exports = api;
@@ -226,7 +227,7 @@
       "svg{background:#fff;border:1px solid #ddd;display:block;margin:8px 0 20px}" +
       "p.policy{font-weight:600;color:#1c1c1c}p.note{color:#555}</style></head><body><h1>" +
       esc(title || "CAN plot") + "</h1><p class=\"policy\">" + POLICY +
-      "</p><p class=\"note\">" + ADAPTER_LABEL + ". Local file. It is not sent to the assistant. Read-only questions only; the vehicle is not changed.</p>";
+      "</p><p class=\"note\">Plug in a USB-CAN dongle. You do not need to know the brand. " + ADAPTER_LABEL + ". Local file. It is not sent to the assistant. Read-only questions only; the vehicle is not changed.</p>";
     if (!series.length) html += "<p>No signal in this recording changed value.</p>";
     series.forEach(function (s) {
       var pts = s.pts, t0 = pts[0].t, t1 = pts[pts.length - 1].t;
@@ -390,9 +391,57 @@
     return lines.join("\n") + "\n";
   }
 
+  var KNOWN = {
+    "0c72:000c": ["Peak PCAN-USB", "peak"],
+    "0c72:000d": ["Peak PCAN-USB Pro", "peak"],
+    "0c72:0011": ["Peak PCAN-USB FD", "peak"],
+    "0c72:0012": ["Peak PCAN-USB Pro FD", "peak"],
+    "0c72:0013": ["Peak PCAN-USB Chip", "peak"],
+    "0c72:0014": ["Peak PCAN-USB X6", "peak"],
+    "0471:1200": ["ZLG USBCAN", "zlg"],
+    "1d50:606f": ["candleLight USB-CAN", "socketcan"]
+  };
+  function hex4(n) { return ("0000" + (n & 0xffff).toString(16)).slice(-4); }
+  function plainAdapterName(dev) {
+    dev = dev || {};
+    var vid = dev.vid, pid = dev.pid;
+    if (vid != null && pid != null) {
+      var key = hex4(vid) + ":" + hex4(pid);
+      if (KNOWN[key]) return KNOWN[key][0];
+      if ((vid & 0xffff) === 0x0c72) return "Peak USB-CAN";
+      if ((vid & 0xffff) === 0x0bfd) return "Kvaser USB-CAN";
+    }
+    var manufacturer = String(dev.manufacturer || "").trim();
+    var product = String(dev.product || "").trim();
+    if (manufacturer && product) return manufacturer + " " + product;
+    if (product) return product;
+    if (manufacturer) return manufacturer;
+    if (vid != null && pid != null) return "unknown USB-CAN, VID:PID " + hex4(vid) + ":" + hex4(pid);
+    if (dev.iface) return "SocketCAN " + dev.iface;
+    return "unknown USB-CAN";
+  }
+  function connectPage(found, lines) {
+    function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+    var html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Windrose Diagnose</title>" +
+      "<style>body{background:#f6f5f2;color:#1c1c1c;font:15px -apple-system,sans-serif;margin:24px}" +
+      "p.policy{font-weight:600}</style></head><body><h1>Windrose Diagnose</h1>" +
+      "<p class=\"policy\">" + POLICY + "</p>" +
+      "<p>Plug in a USB-CAN dongle. You do not need to know the brand.</p>";
+    if (!found || !found.length) html += "<p>Nothing is plugged in.</p>";
+    else {
+      html += "<ul>";
+      found.forEach(function (dev) { html += "<li>" + esc(plainAdapterName(dev)) + "</li>"; });
+      html += "</ul>";
+    }
+    (lines || []).forEach(function (line) { html += "<p>" + esc(line) + "</p>"; });
+    return html + "</body></html>";
+  }
+
   return {
     policy: POLICY,
     adapterLabel: ADAPTER_LABEL,
+    plainAdapterName: plainAdapterName,
+    connectPage: connectPage,
     isInquiry: isInquiry,
     serviceIsRead: serviceIsRead,
     udsReadFrames: udsReadFrames,

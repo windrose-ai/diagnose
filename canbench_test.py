@@ -391,6 +391,134 @@ class DecodeTests(unittest.TestCase):
                 port.send(*good)
             self.assertNotIn("可以问，不能改", str(caught.exception))
 
+    def test_connect_names_dongle_and_only_asks(self):
+        self.assertIn("Peak PCAN-USB", cb.plain_adapter_name("", "", 0x0C72, 0x000C, catalog=cb._catalog(0x0C72, 0x000C)))
+        self.assertEqual(
+            cb.plain_adapter_name("", "", 0x1234, 0xABCD),
+            "unknown USB-CAN, VID:PID 1234:abcd",
+        )
+        self.assertEqual(cb.explain_failure(cb.Fail(cb.NOT_A_QUESTION)), cb.PLAIN_BOUNDARY)
+        self.assertEqual(cb.explain_failure(cb.Fail("PCAN-Basic library not found")), cb.PLAIN_DRIVER)
+        self.assertEqual(cb.explain_failure(cb.Fail("bitrate is 250000 bit/s")), cb.PLAIN_BITRATE)
+        self.assertEqual(cb.explain_failure(cb.Fail("Network is down")), cb.PLAIN_POWER)
+        with tempfile.TemporaryDirectory() as root:
+            usb = os.path.join(root, "bus", "usb", "devices", "1-2")
+            os.makedirs(usb)
+            with open(os.path.join(usb, "idVendor"), "w", encoding="ascii") as handle:
+                handle.write("0c72\n")
+            with open(os.path.join(usb, "idProduct"), "w", encoding="ascii") as handle:
+                handle.write("000c\n")
+            iface = os.path.join(root, "class", "net", "can0")
+            os.makedirs(iface)
+            with open(os.path.join(iface, "type"), "w", encoding="ascii") as handle:
+                handle.write("280\n")
+            os.symlink(usb, os.path.join(iface, "device"))
+            unknown = os.path.join(root, "bus", "usb", "devices", "1-3")
+            os.makedirs(unknown)
+            iface_node = os.path.join(root, "bus", "usb", "devices", "1-3:1.0")
+            os.makedirs(iface_node)
+            with open(os.path.join(unknown, "idVendor"), "w", encoding="ascii") as handle:
+                handle.write("1234\n")
+            with open(os.path.join(unknown, "idProduct"), "w", encoding="ascii") as handle:
+                handle.write("abcd\n")
+            driver = os.path.join(root, "bus", "usb", "drivers", "gs_usb")
+            os.makedirs(driver)
+            os.symlink(driver, os.path.join(iface_node, "driver"))
+            found = cb.enumerate_adapters(root, libs={"peak": False, "zlg": False})
+            plains = [item["plain"] for item in found]
+            self.assertIn("Peak PCAN-USB", plains)
+            self.assertIn("unknown USB-CAN, VID:PID 1234:abcd", plains)
+            self.assertTrue(any(item["iface"] == "can0" and item["ready"] for item in found))
+            bare = os.path.join(root, "bus", "usb", "devices", "1-4")
+            os.makedirs(bare)
+            with open(os.path.join(bare, "idVendor"), "w", encoding="ascii") as handle:
+                handle.write("0471\n")
+            with open(os.path.join(bare, "idProduct"), "w", encoding="ascii") as handle:
+                handle.write("1200\n")
+            only = cb.enumerate_adapters(os.path.join(root, "empty") if False else root, libs={"peak": False, "zlg": False})
+            zlg = [item for item in only if item["vid"] == 0x0471]
+            self.assertEqual(zlg[0]["plain"], "ZLG USBCAN")
+            self.assertFalse(zlg[0]["ready"])
+        quiet = cb.run_connect(found=[])
+        self.assertIn(cb.PLAIN_NOTHING, "\n".join(quiet["lines"]))
+        self.assertEqual(quiet["asked"], [])
+        missing = cb.run_connect(found=[{"plain": "Peak PCAN-USB", "ready": False, "backend": "peak"}])
+        self.assertIn(cb.PLAIN_DRIVER, "\n".join(missing["lines"]))
+        self.assertEqual(missing["asked"], [])
+
+        class Box:
+            def __init__(self, fail=None, heard=None):
+                self.fail = fail
+                self.heard = heard or []
+                self.sent = []
+                self.transmitting = False
+                self.classic = False
+                self.bitrate = 0
+
+            def open_transmit(self, classic=False, bitrate=500000):
+                if self.fail:
+                    raise cb.Fail(self.fail)
+                self.transmitting = True
+                self.classic = classic
+                self.bitrate = bitrate
+
+            def send(self, can_id, data, extended=False, fd=False, brs=False):
+                data = cb.guard_transmit(self, can_id, data, extended)
+                self.sent.append((can_id, bytes(data), extended))
+
+            def read_frames(self, seconds=0.25):
+                return self.heard
+
+            def close(self):
+                self.transmitting = False
+
+        box = Box(heard=[{"id": 0x18DAF110, "ext": True, "data": bytes.fromhex("0362F190000000")}])
+        report = cb.run_connect(
+            found=[{"plain": "Peak PCAN-USB", "backend": "peak", "iface": "can0", "ready": True}],
+            open_port=lambda *args, **kwargs: box,
+        )
+        self.assertTrue(report["ok"])
+        self.assertEqual(len(box.sent), 4)
+        for can_id, data, ext in box.sent:
+            self.assertEqual(can_id, 0x18DBFFF1)
+            self.assertTrue(ext)
+            self.assertTrue(cb.is_inquiry(can_id, data, ext))
+            self.assertNotIn(data[1], cb.BLOCKED_SERVICES)
+        text = "\n".join(report["lines"])
+        self.assertIn("Peak PCAN-USB", text)
+        self.assertIn("data value", text)
+        self.assertIn("public dictionary", text)
+        slow = Box(fail="interface is 250000 bit/s")
+        denied = cb.run_connect(
+            found=[{"plain": "ZLG USBCAN", "backend": "zlg", "iface": "", "ready": True}],
+            open_port=lambda *args, **kwargs: slow,
+        )
+        self.assertFalse(denied["ok"])
+        self.assertIn(cb.PLAIN_BITRATE, "\n".join(denied["lines"]))
+        self.assertEqual(slow.sent, [])
+        dead = Box(fail="Network is down")
+        powered = cb.run_connect(
+            found=[{"plain": "SocketCAN can0", "backend": "socketcan", "iface": "can0", "ready": True}],
+            open_port=lambda *args, **kwargs: dead,
+        )
+        self.assertIn(cb.PLAIN_POWER, "\n".join(powered["lines"]))
+        page = cb.connect_html(
+            [{"plain": "unknown USB-CAN, VID:PID 1234:abcd"}],
+            ["可以问，不能改。"],
+        )
+        self.assertIn("unknown USB-CAN, VID:PID 1234:abcd", page)
+        self.assertIn("可以问，不能改", page)
+        self.assertIn("do not need to know the brand", page)
+        real_enum = cb.enumerate_adapters
+        cb.enumerate_adapters = lambda *args, **kwargs: []
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                self.assertEqual(cb.main(["connect"]), 0)
+            self.assertIn(cb.PLAIN_NOTHING, buf.getvalue())
+        finally:
+            cb.enumerate_adapters = real_enum
+
 
 if __name__ == "__main__":
     unittest.main()

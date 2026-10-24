@@ -18,8 +18,9 @@ import re
 import socket
 import struct
 import sys
+import time
 
-CANBENCH_REV = "2026-10-24.2"
+CANBENCH_REV = "2026-10-24.3"
 ADAPTER_LABEL = "CAN adapter (Peak, ZLG, …)"
 CH1 = 0x51  # PCAN_USBBUS1
 LISTEN_ONLY = 0x08
@@ -645,6 +646,7 @@ def plot_html(frames, dbc, title="CAN plot"):
         html.escape(title),
         "</h1><p class=\"policy\">可以问，不能改</p>",
         "<p class=\"note\">",
+        "Plug in a USB-CAN dongle. You do not need to know the brand. ",
         ADAPTER_LABEL,
         ". Local file. It is not sent to the assistant. ",
         "Read-only questions only; the vehicle is not changed.</p>",
@@ -887,6 +889,10 @@ class Msg(ctypes.Structure):
     _fields_ = [("ID", ctypes.c_uint32), ("MSGTYPE", ctypes.c_uint8), ("LEN", ctypes.c_uint8), ("DATA", ctypes.c_uint8 * 8)]
 
 
+class Stamp(ctypes.Structure):
+    _fields_ = [("millis", ctypes.c_uint32), ("millis_overflow", ctypes.c_uint16), ("micros", ctypes.c_uint16)]
+
+
 class MsgFD(ctypes.Structure):
     _fields_ = [("ID", ctypes.c_uint32), ("MSGTYPE", ctypes.c_uint8), ("DLC", ctypes.c_uint8), ("DATA", ctypes.c_uint8 * 64)]
 
@@ -902,6 +908,9 @@ def load_peak(path):
     lib.CAN_GetValue.argtypes = [ctypes.c_uint16, ctypes.c_uint8, ctypes.c_void_p, ctypes.c_uint32]
     for name in ("CAN_Initialize", "CAN_InitializeFD", "CAN_Uninitialize", "CAN_Write", "CAN_WriteFD", "CAN_SetValue", "CAN_GetValue"):
         getattr(lib, name).restype = ctypes.c_uint32
+    if hasattr(lib, "CAN_Read"):
+        lib.CAN_Read.argtypes = [ctypes.c_uint16, ctypes.POINTER(Msg), ctypes.POINTER(Stamp)]
+        lib.CAN_Read.restype = ctypes.c_uint32
     return lib
 
 
@@ -1025,6 +1034,28 @@ class PeakBus:
         if st != OK:
             raise Fail("CAN_Write failed (0x%X)." % st)
 
+    def read_frames(self, seconds=0.25):
+        """Drain frames already on the adapter. Empty means the bus was quiet."""
+        if self.lib is None or not hasattr(self.lib, "CAN_Read"):
+            return []
+        end = time.monotonic() + seconds
+        out = []
+        while time.monotonic() < end and len(out) < 80:
+            msg = Msg()
+            stamp = Stamp()
+            st = self.lib.CAN_Read(CH1, ctypes.byref(msg), ctypes.byref(stamp))
+            if st == 0x00020:
+                time.sleep(0.02)
+                continue
+            if st != OK:
+                break
+            out.append({
+                "id": int(msg.ID) & 0x1FFFFFFF,
+                "ext": bool(msg.MSGTYPE & T_EXT),
+                "data": bytes(bytearray(msg.DATA[:msg.LEN])),
+            })
+        return out
+
     def close(self):
         if self.lib is not None and (self.listening or self.transmitting):
             self.lib.CAN_Uninitialize(CH1)
@@ -1094,6 +1125,9 @@ def load_zlg(path):
     lib.VCI_Transmit.argtypes = [u32, u32, u32, ctypes.POINTER(VciCanObj), u32]
     for name in ("VCI_OpenDevice", "VCI_CloseDevice", "VCI_InitCAN", "VCI_StartCAN", "VCI_Transmit"):
         getattr(lib, name).restype = u32
+    if hasattr(lib, "VCI_Receive"):
+        lib.VCI_Receive.argtypes = [u32, u32, u32, ctypes.POINTER(VciCanObj), u32, ctypes.c_int]
+        lib.VCI_Receive.restype = u32
     return lib
 
 
@@ -1190,6 +1224,22 @@ class ZlgBus:
         if sent != 1:
             raise Fail("%s: ZLG Transmit failed." % ADAPTER_LABEL)
 
+    def read_frames(self, seconds=0.25):
+        if self.lib is None or not self.opened or not hasattr(self.lib, "VCI_Receive"):
+            return []
+        arr = (VciCanObj * 40)()
+        wait = max(1, min(200, int(seconds * 1000)))
+        got = int(self.lib.VCI_Receive(self.dev_type, self.dev_index, self.channel, arr, 40, wait))
+        out = []
+        for i in range(max(0, min(got, 40))):
+            obj = arr[i]
+            out.append({
+                "id": int(obj.ID) & 0x1FFFFFFF,
+                "ext": bool(obj.ExternFlag),
+                "data": bytes(bytearray(obj.Data[:obj.DataLen])),
+            })
+        return out
+
     def close(self):
         if self.lib is not None and self.opened:
             self.lib.VCI_CloseDevice(self.dev_type, self.dev_index)
@@ -1284,6 +1334,25 @@ class SocketCanBus:
         except OSError as exc:
             raise Fail("%s: SocketCAN send failed (%s)." % (ADAPTER_LABEL, getattr(exc, "strerror", None) or exc))
 
+    def read_frames(self, seconds=0.25):
+        if self.sock is None:
+            return []
+        self.sock.settimeout(seconds)
+        out = []
+        end = time.monotonic() + seconds
+        while time.monotonic() < end and len(out) < 80:
+            try:
+                raw = self.sock.recv(16)
+            except (TimeoutError, socket.timeout, OSError):
+                break
+            if len(raw) < 16:
+                continue
+            ident, dlc = struct.unpack_from("=IB", raw)
+            ext = bool(ident & CAN_EFF_FLAG)
+            data = raw[8:8 + min(dlc, 8)]
+            out.append({"id": ident & 0x1FFFFFFF, "ext": ext, "data": data})
+        return out
+
     def close(self):
         sock = self.sock
         self.sock = None
@@ -1335,6 +1404,352 @@ def open_can_port(adapter="auto", lib_path="", iface="", dev_type=4, dev_index=0
     if kind == "zlg":
         return ZlgBus(lib_path=lib_path, dev_type=dev_type, dev_index=dev_index, channel=channel)
     return SocketCanBus(iface or os.environ.get("WR_CAN_IFACE") or "can0")
+
+
+# Public names only. No vehicle database. VID:PID values are the ones the
+# vendors and the Linux CAN drivers publish.
+KNOWN_USB_CAN = {
+    (0x0C72, 0x000C): ("Peak PCAN-USB", "peak"),
+    (0x0C72, 0x000D): ("Peak PCAN-USB Pro", "peak"),
+    (0x0C72, 0x0011): ("Peak PCAN-USB FD", "peak"),
+    (0x0C72, 0x0012): ("Peak PCAN-USB Pro FD", "peak"),
+    (0x0C72, 0x0013): ("Peak PCAN-USB Chip", "peak"),
+    (0x0C72, 0x0014): ("Peak PCAN-USB X6", "peak"),
+    (0x0471, 0x1200): ("ZLG USBCAN", "zlg"),
+    (0x1D50, 0x606F): ("candleLight USB-CAN", "socketcan"),
+}
+# A response the vehicle sends after a read. These names are ISO 14229, not a truck DBC.
+PUBLIC_UDS = {
+    0x50: "diagnostic session",
+    0x59: "fault information",
+    0x62: "data value",
+    0x7E: "tester still present",
+    0x7F: "the vehicle declined the question",
+}
+PLAIN_NOTHING = (
+    "Nothing is plugged in. Plug a USB-CAN dongle into this computer. "
+    "You do not need to know if it is Peak, ZLG, or another brand."
+)
+PLAIN_DRIVER = (
+    "The adapter driver is missing. Install the driver that came with the dongle, then plug it in again. "
+    "You do not need to choose Peak or ZLG."
+)
+PLAIN_BITRATE = (
+    "The dongle is at the wrong bitrate. The diagnostic plug needs classic CAN at 500 kbit/s."
+)
+PLAIN_POWER = (
+    "The vehicle bus has no power, or the diagnostic cable is not seated. "
+    "Turn the ignition on and check OBD pins 6 and 14."
+)
+PLAIN_BOUNDARY = (
+    "可以问，不能改。This tool only asks for data. It will not write, flash, unlock, or command the vehicle."
+)
+
+
+def _read_text(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def _hex_id(text):
+    try:
+        return int(text, 16)
+    except (TypeError, ValueError):
+        return None
+
+
+def plain_adapter_name(manufacturer, product, vid, pid, iface="", catalog=None):
+    """Vendor and product when we know them, otherwise unknown USB-CAN, VID:PID."""
+    if catalog:
+        return catalog[0]
+    manufacturer = (manufacturer or "").strip()
+    product = (product or "").strip()
+    if manufacturer and product:
+        return "%s %s" % (manufacturer, product)
+    if product:
+        return product
+    if manufacturer:
+        return manufacturer
+    if vid is not None and pid is not None:
+        return "unknown USB-CAN, VID:PID %04x:%04x" % (vid, pid)
+    if iface:
+        return "SocketCAN %s" % iface
+    return "unknown USB-CAN"
+
+
+def _catalog(vid, pid):
+    if vid is None or pid is None:
+        return None
+    found = KNOWN_USB_CAN.get((vid, pid))
+    if found:
+        return found
+    if vid == 0x0C72:
+        return ("Peak USB-CAN", "peak")
+    if vid == 0x0BFD:
+        return ("Kvaser USB-CAN", "socketcan")
+    return None
+
+
+def _backend_for(driver, catalog, iface):
+    """A dongle the OS already shows as a CAN port is used that way. Otherwise the vendor library."""
+    if iface:
+        return "socketcan"
+    driver = (driver or "").lower()
+    if catalog:
+        return catalog[1]
+    if "peak" in driver or "pcan" in driver:
+        return "peak"
+    if "zlg" in driver or "controlcan" in driver:
+        return "zlg"
+    return "socketcan"
+
+
+def _usb_parent(start):
+    if not os.path.exists(start):
+        return ""
+    cur = os.path.realpath(start)
+    for _ in range(8):
+        if os.path.isfile(os.path.join(cur, "idVendor")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return ""
+
+
+def _driver_of(usb_node):
+    devices = os.path.dirname(usb_node)
+    base = os.path.basename(usb_node)
+    try:
+        names = os.listdir(devices)
+    except OSError:
+        return ""
+    for name in names:
+        if not name.startswith(base + ":"):
+            continue
+        link = os.path.join(devices, name, "driver")
+        if os.path.islink(link) or os.path.isdir(link):
+            return os.path.basename(os.path.realpath(link))
+    own = os.path.join(usb_node, "driver")
+    if os.path.islink(own) or os.path.isdir(own):
+        return os.path.basename(os.path.realpath(own))
+    return ""
+
+
+def _usb_record(node, iface, libs):
+    vid = _hex_id(_read_text(os.path.join(node, "idVendor")))
+    pid = _hex_id(_read_text(os.path.join(node, "idProduct")))
+    if vid is None or pid is None:
+        return None
+    catalog = _catalog(vid, pid)
+    driver = _driver_of(node)
+    backend = _backend_for(driver, catalog, iface)
+    lib_ready = (backend == "peak" and libs.get("peak")) or (backend == "zlg" and libs.get("zlg"))
+    ready = bool(iface) or lib_ready or bool(driver)
+    return {
+        "plain": plain_adapter_name(
+            _read_text(os.path.join(node, "manufacturer")),
+            _read_text(os.path.join(node, "product")),
+            vid, pid, iface, catalog,
+        ),
+        "backend": backend,
+        "iface": iface or "",
+        "vid": vid,
+        "pid": pid,
+        "driver": driver,
+        "ready": ready,
+    }
+
+
+def enumerate_adapters(sys_root="/sys", libs=None):
+    """List plugged-in CAN dongles. Does not open them and does not transmit."""
+    if libs is None:
+        libs = {"peak": bool(default_lib()), "zlg": bool(default_zlg_lib())}
+    found = []
+    seen = set()
+    net = os.path.join(sys_root, "class", "net")
+    if os.path.isdir(net):
+        for name in sorted(os.listdir(net)):
+            if _read_text(os.path.join(net, name, "type")) != "280":
+                continue
+            usb = _usb_parent(os.path.join(net, name, "device"))
+            if usb:
+                rec = _usb_record(usb, name, libs)
+                if rec:
+                    found.append(rec)
+                    seen.add(os.path.realpath(usb))
+                    continue
+            found.append({
+                "plain": "SocketCAN %s" % name,
+                "backend": "socketcan",
+                "iface": name,
+                "vid": None,
+                "pid": None,
+                "driver": "",
+                "ready": True,
+            })
+    usb_root = os.path.join(sys_root, "bus", "usb", "devices")
+    if os.path.isdir(usb_root):
+        for name in sorted(os.listdir(usb_root)):
+            node = os.path.join(usb_root, name)
+            if not os.path.isdir(node) or os.path.realpath(node) in seen:
+                continue
+            if not os.path.isfile(os.path.join(node, "idVendor")):
+                continue
+            vid = _hex_id(_read_text(os.path.join(node, "idVendor")))
+            pid = _hex_id(_read_text(os.path.join(node, "idProduct")))
+            driver = _driver_of(node)
+            catalog = _catalog(vid, pid)
+            looks_can = catalog or any(
+                bit in driver.lower() for bit in ("can", "peak", "pcan", "zlg", "gs_usb", "kvaser", "usbcan")
+            )
+            if not looks_can:
+                continue
+            rec = _usb_record(node, "", libs)
+            if rec:
+                found.append(rec)
+                seen.add(os.path.realpath(node))
+    return found
+
+
+def explain_failure(exc):
+    """Plain reason. The four cases are bitrate, bus power, missing driver, and ask versus write."""
+    text = str(exc)
+    low = text.lower()
+    if "可以问" in text or "not a read-only" in low or "not a question" in low:
+        return PLAIN_BOUNDARY
+    if "bit/s" in low or "bitrate" in low or "kbit" in low:
+        return PLAIN_BITRATE
+    if "library not found" in low or "driver is missing" in low or "driver" in low and "not found" in low:
+        return PLAIN_DRIVER
+    if any(bit in low for bit in (
+        "network is down", "enetdown", "no such device", "opendevice", "no power",
+        "not open", "startcan", "initcan", "bus has no power",
+    )):
+        return PLAIN_POWER
+    return text
+
+
+def _is_uds_response(can_id):
+    """Vehicle replies: WH13 0x18DAF1xx, or J1979 0x7E8–0x7EF. Never a request id."""
+    n = can_id & 0x1FFFFFFF
+    return (n & 0xFFFFFF00) == 0x18DAF100 or (0x7E8 <= n <= 0x7EF)
+
+
+def decode_public(frames):
+    """Name traffic with the public J1939 list and standard UDS response names. No truck DBC."""
+    lines = []
+    uds_left = []
+    other = []
+    for fr in frames:
+        data = bytes(fr.get("data") or b"")
+        can_id = fr.get("id", 0) & 0x1FFFFFFF
+        if _is_uds_response(can_id):
+            uds_left.append((can_id, data))
+        else:
+            other.append(fr)
+    if other:
+        report = j1939_report(other).strip()
+        if report:
+            lines.append(report)
+    for can_id, data in uds_left:
+        if len(data) >= 2 and 1 <= data[0] <= 7 and len(data) >= 1 + data[0]:
+            payload = data[1:1 + data[0]]
+        else:
+            payload = data
+        if not payload:
+            continue
+        sid = payload[0]
+        if sid == 0x7F and len(payload) >= 3 and payload[2] == 0x33:
+            lines.append("Response 0x%X: the vehicle asked for a security unlock. This tool will not unlock it." % can_id)
+            continue
+        name = PUBLIC_UDS.get(sid, "")
+        if name:
+            lines.append("Response 0x%X: %s." % (can_id, name))
+        else:
+            lines.append("Response 0x%X: %d bytes, not in the public dictionary." % (can_id, len(data)))
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def connect_html(found, lines):
+    """The page shown when Diagnose opens. Brand is a name, not a choice the user must make."""
+    body = [
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Windrose Diagnose</title>",
+        "<style>body{background:#f6f5f2;color:#1c1c1c;font:15px -apple-system,sans-serif;margin:24px}",
+        "p.policy{font-weight:600}li{margin:6px 0}</style></head><body>",
+        "<h1>Windrose Diagnose</h1>",
+        "<p class=\"policy\">可以问，不能改</p>",
+        "<p>Plug in a USB-CAN dongle. You do not need to know the brand.</p>",
+    ]
+    if not found:
+        body.append("<p>%s</p>" % html.escape(PLAIN_NOTHING))
+    else:
+        body.append("<ul>")
+        for dev in found:
+            body.append("<li>%s</li>" % html.escape(dev.get("plain") or "unknown USB-CAN"))
+        body.append("</ul>")
+    for line in lines:
+        body.append("<p>%s</p>" % html.escape(line))
+    body.append("</body></html>")
+    return "".join(body)
+
+
+def run_connect(found=None, open_port=None, libs=None):
+    """Enumerate, name, and when a dongle is ready ask read-only UDS at classic 500 kbit/s."""
+    if found is None:
+        found = enumerate_adapters(libs=libs)
+    lines = ["可以问，不能改。"]
+    asked = []
+    heard = []
+    if not found:
+        lines.append(PLAIN_NOTHING)
+        return {"ok": False, "found": found, "lines": lines, "asked": asked, "heard": heard}
+    lines.append("Found: %s." % "; ".join(dev["plain"] for dev in found))
+    ready = [dev for dev in found if dev.get("ready")]
+    if not ready:
+        lines.append(PLAIN_DRIVER)
+        return {"ok": False, "found": found, "lines": lines, "asked": asked, "heard": heard}
+    if open_port is None:
+        open_port = open_can_port
+    last = None
+    for dev in ready:
+        port = None
+        try:
+            port = open_port(dev.get("backend") or "auto", iface=dev.get("iface") or "")
+            port.open_transmit(classic=True, bitrate=DIAGNOSTIC_BITRATE)
+            poll = uds_read_frames("extended")
+            for can_id, data, ext in poll:
+                port.send(can_id, data, extended=ext)
+                asked.append((can_id, bytes(data), ext))
+            if hasattr(port, "read_frames"):
+                heard = list(port.read_frames(0.05) or [])
+            lines.append(
+                "Asked %s for session, fault codes, and VIN on 0x18DBFFF1. Nothing on the vehicle was changed."
+                % dev["plain"]
+            )
+            if heard:
+                lines.append("Heard traffic and decoded it with the public dictionary.")
+                text = decode_public(heard).strip()
+                if text:
+                    lines.append(text)
+            else:
+                lines.append(
+                    "No messages came back. Turn the ignition on and seat the cable on the diagnostic plug."
+                )
+            return {"ok": True, "found": found, "lines": lines, "asked": asked, "heard": heard}
+        except Fail as exc:
+            last = exc
+            lines.append("%s: %s" % (dev["plain"], explain_failure(exc)))
+        finally:
+            if port is not None:
+                port.close()
+    if last is not None and PLAIN_DRIVER not in lines[-1] and PLAIN_BITRATE not in lines[-1] and PLAIN_POWER not in lines[-1] and PLAIN_BOUNDARY not in lines[-1]:
+        lines.append(explain_failure(last))
+    return {"ok": False, "found": found, "lines": lines, "asked": asked, "heard": heard}
 
 
 def _keys(name):
@@ -1500,15 +1915,37 @@ def _cmd_send(argv):
     return 0
 
 
+def _cmd_connect(argv):
+    report = run_connect()
+    for line in report["lines"]:
+        print(line)
+    page = _opt(argv, "--page")
+    if page:
+        with open(page, "w", encoding="utf-8") as handle:
+            handle.write(connect_html(report["found"], report["lines"]))
+        print(page)
+    if report["ok"] or not any(dev.get("ready") for dev in report["found"]):
+        return 0
+    return 2
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print("可以问，不能改")
-        print("CAN adapter (Peak, ZLG, …). --adapter peak|zlg|socketcan")
+        print("Plug in a USB-CAN dongle, then: connect")
+        print("You do not need to know if it is Peak, ZLG, or another brand.")
+        print(ADAPTER_LABEL)
+        found = enumerate_adapters()
+        if found:
+            print("Plugged in: %s." % "; ".join(dev["plain"] for dev in found))
+        else:
+            print(PLAIN_NOTHING)
         print("plot FILE.asc [--dbc FILE]")
         print("j1939 FILE.asc")
         print("decode FILE.asc [--dbc FILE]")
         print("dbc set FILE.dbc")
         print("send    ask the standard J1979 questions (speed, fault codes, VIN)")
+        print("connect    find the dongle and ask read-only UDS on 0x18DBFFF1")
         print("send --uds    WH13 UDS poll on 29-bit 0x18DBFFF1 (classic 500 kbit/s)")
         print("send --uds --adapter socketcan --iface can0")
         print("send --uds --adapter zlg    ZLG ControlCAN, classic 500 kbit/s")
@@ -1532,6 +1969,8 @@ def main(argv):
             return _cmd_dbc(rest)
         if cmd == "send":
             return _cmd_send(rest)
+        if cmd == "connect":
+            return _cmd_connect(rest)
         raise Fail("unknown command: %s" % cmd)
     except Fail as exc:
         sys.stderr.write(str(exc) + "\n")

@@ -8,12 +8,13 @@ DBC that you supply.
 
 ## Design principles
 
-- **可以问，不能改。** A CAN adapter (Peak, ZLG, …) may transmit on the diagnostic CAN only:
-  OBD pins 6 and 14, classic CAN at 500 kbit/s, via TGW / GWCANFD9.
-  `send --uds --adapter peak`, `--adapter zlg`, or `--adapter socketcan --iface can0`.
-  PCAN-Basic also covers other devices that ship that library. SocketCAN covers
-  USB-CAN boxes the OS exposes as a can interface, including Peak and ZLG kernel
-  drivers and other vendor adapters. Recording stays listen-only.
+- **Plug in a dongle.** On open, Diagnose lists what is connected in plain language
+  (vendor and product when known, otherwise “unknown USB-CAN, VID:PID …”).
+  You do not choose Peak or ZLG. `connect` asks read-only UDS at classic 500 kbit/s
+  on `0x18DBFFF1` when a dongle is ready. If the bus is talking, the traffic is
+  named with the public J1939 list and standard UDS response names.
+  A missing driver, the wrong bitrate, a dead diagnostic bus, and a write are each
+  explained in a sentence. Recording stays listen-only.
 - **WH13 / E700 UDS ids (29-bit).** `send --uds` asks on functional `0x18DBFFF1`
   (tester source `0xF1`). `send --uds --target xx` asks on physical `0x18DAxxF1`.
   Responses come back on `0x18DAF1xx` and are never transmitted. 11-bit `0x7DF`
@@ -48,11 +49,12 @@ DBC that you supply.
 ## Quick start
 
 ```sh
-python3 canbench.py            # run the CLI
+python3 canbench.py            # what is plugged in
+python3 canbench.py connect    # ask the vehicle, read-only
 python3 canbench_test.py       # run the tests
 ```
 
-Hardware: any Classic CAN adapter at about 500 kbit/s. Peak (PCAN-Basic), ZLG (ControlCAN), and SocketCAN are built in. PCAN-USB FD does not speak CAN XL.
+Hardware: plug in a USB-CAN dongle. Peak, ZLG, SocketCAN, and other USB-CAN devices are recognized from the system device list. PCAN-USB FD does not speak CAN XL.
 
 ## Scope and safety
 
