@@ -4,8 +4,10 @@
 # Plot, a DBC you choose, and J1939 stay on this computer. Nothing here is sent
 # to the assistant. send() may ask a read-only diagnostic question. Clear,
 # write, flash, security access, and control frames are refused.
-# Recording stays listen-only. PCAN-USB FD does not speak CAN XL.
-# CANBENCH_REV = "2026-10-24.1"
+# Recording stays listen-only. The ask path is a CAN adapter (Peak, ZLG, …):
+# PCAN-Basic, ZLG ControlCAN, or SocketCAN, classic ~500 kbit/s.
+# PCAN-USB FD does not speak CAN XL.
+# CANBENCH_REV = "2026-10-24.2"
 
 from __future__ import annotations
 
@@ -13,9 +15,12 @@ import ctypes
 import html
 import os
 import re
+import socket
+import struct
 import sys
 
-CANBENCH_REV = "2026-10-24.1"
+CANBENCH_REV = "2026-10-24.2"
+ADAPTER_LABEL = "CAN adapter (Peak, ZLG, …)"
 CH1 = 0x51  # PCAN_USBBUS1
 LISTEN_ONLY = 0x08
 OK = 0x00000
@@ -639,7 +644,9 @@ def plot_html(frames, dbc, title="CAN plot"):
         "</style></head><body><h1>",
         html.escape(title),
         "</h1><p class=\"policy\">可以问，不能改</p>",
-        "<p class=\"note\">Local file. It is not sent to the assistant. ",
+        "<p class=\"note\">",
+        ADAPTER_LABEL,
+        ". Local file. It is not sent to the assistant. ",
         "Read-only questions only; the vehicle is not changed.</p>",
     ]
     if not series:
@@ -918,12 +925,27 @@ def default_lib():
     return ""
 
 
-class PeakBus:
-    """PEAK adapter. open_listen records and does not transmit.
+def guard_transmit(bus, can_id, data, extended):
+    """Shared ask-only check for every CAN adapter. Called before any write."""
+    if not bus.transmitting:
+        raise Fail("Call open_transmit() before send().")
+    data = bytes(data)
+    if not is_inquiry(can_id, data, extended):
+        raise Fail(NOT_A_QUESTION)
+    if _uds_ask_frame(data) and (not bus.classic or bus.bitrate != DIAGNOSTIC_BITRATE):
+        raise Fail(UDS_BUS_NOTE)
+    return data
 
-    open_transmit asks on the diagnostic interface. send() still refuses any
-    frame that is not an allowlisted read.
+
+class PeakBus:
+    """PCAN-Basic adapter (Peak and other PCAN-Basic devices).
+
+    open_listen records and does not transmit. open_transmit asks on the
+    diagnostic interface. send() still refuses any frame that is not an
+    allowlisted read.
     """
+
+    name = "peak"
 
     def __init__(self, lib=None, lib_path=""):
         self.lib = lib
@@ -948,7 +970,10 @@ class PeakBus:
             return
         path = self.lib_path or default_lib()
         if not path:
-            raise Fail("PEAK library not found. Set WR_PCBUSB or install PCBUSB / PCAN-Basic.")
+            raise Fail(
+                "%s: PCAN-Basic library not found. Set WR_PCBUSB, or use --adapter zlg "
+                "or --adapter socketcan --iface can0." % ADAPTER_LABEL
+            )
         self.lib = load_peak(path)
 
     def _open(self, classic, bitrate, listen):
@@ -964,7 +989,10 @@ class PeakBus:
         else:
             st = self.lib.CAN_InitializeFD(CH1, WINDROSE_FD)
         if st != OK:
-            raise Fail("Could not open the PEAK adapter (0x%X). Close PCAN-View if it is open." % st)
+            raise Fail(
+                "%s: could not open PCAN-Basic (0x%X). Close PCAN-View if it is open."
+                % (ADAPTER_LABEL, st)
+            )
         if listen:
             got = ctypes.c_uint32(0)
             if self.lib.CAN_GetValue(CH1, LISTEN_ONLY, ctypes.byref(got), 4) != OK or got.value != 1:
@@ -976,13 +1004,7 @@ class PeakBus:
         self.bitrate = bitrate
 
     def send(self, can_id, data, extended=False, fd=False, brs=False):
-        if not self.transmitting:
-            raise Fail("Call open_transmit() before send().")
-        data = bytes(data)
-        if not is_inquiry(can_id, data, extended):
-            raise Fail(NOT_A_QUESTION)
-        if _uds_ask_frame(data) and (not self.classic or self.bitrate != DIAGNOSTIC_BITRATE):
-            raise Fail(UDS_BUS_NOTE)
+        data = guard_transmit(self, can_id, data, extended)
         self._ensure_lib()
         if fd or len(data) > 8:
             msg = MsgFD()
@@ -1008,6 +1030,311 @@ class PeakBus:
             self.lib.CAN_Uninitialize(CH1)
         self.listening = False
         self.transmitting = False
+
+
+# Classic SJA1000 timings used by ZLG ControlCAN. 500 kbit/s is 0x00, 0x1C.
+ZLG_TIMING = {1000000: (0x00, 0x14), 500000: (0x00, 0x1C), 250000: (0x01, 0x1C), 125000: (0x03, 0x1C)}
+CAN_EFF_FLAG = 0x80000000
+
+
+class VciInit(ctypes.Structure):
+    _fields_ = [
+        ("AccCode", ctypes.c_uint32),
+        ("AccMask", ctypes.c_uint32),
+        ("Reserved", ctypes.c_uint32),
+        ("Filter", ctypes.c_uint8),
+        ("Timing0", ctypes.c_uint8),
+        ("Timing1", ctypes.c_uint8),
+        ("Mode", ctypes.c_uint8),
+    ]
+
+
+class VciCanObj(ctypes.Structure):
+    _fields_ = [
+        ("ID", ctypes.c_uint32),
+        ("TimeStamp", ctypes.c_uint32),
+        ("TimeFlag", ctypes.c_uint8),
+        ("SendType", ctypes.c_uint8),
+        ("RemoteFlag", ctypes.c_uint8),
+        ("ExternFlag", ctypes.c_uint8),
+        ("DataLen", ctypes.c_uint8),
+        ("Data", ctypes.c_uint8 * 8),
+        ("Reserved", ctypes.c_uint8 * 3),
+    ]
+
+
+def default_zlg_lib():
+    for key in ("WR_ZLG_LIB", "ZLG_LIB"):
+        env = os.environ.get(key) or ""
+        if env and os.path.isfile(env):
+            return env
+    names = [
+        os.path.expanduser("~/.windrose/zlg/libcontrolcan.so"),
+        "/usr/lib/libcontrolcan.so",
+        "/usr/local/lib/libcontrolcan.so",
+        "/opt/zlg/libcontrolcan.so",
+        r"C:\Windows\System32\ControlCAN.dll",
+    ]
+    for base in (os.environ.get("ProgramFiles", ""), os.environ.get("ProgramFiles(x86)", "")):
+        if base:
+            names.append(os.path.join(base, "ZLG", "ControlCAN.dll"))
+    for path in names:
+        if path and os.path.isfile(path):
+            return path
+    return ""
+
+
+def load_zlg(path):
+    lib = ctypes.WinDLL(path) if os.name == "nt" else ctypes.CDLL(path)
+    u32 = ctypes.c_uint32
+    lib.VCI_OpenDevice.argtypes = [u32, u32, u32]
+    lib.VCI_CloseDevice.argtypes = [u32, u32]
+    lib.VCI_InitCAN.argtypes = [u32, u32, u32, ctypes.POINTER(VciInit)]
+    lib.VCI_StartCAN.argtypes = [u32, u32, u32]
+    lib.VCI_Transmit.argtypes = [u32, u32, u32, ctypes.POINTER(VciCanObj), u32]
+    for name in ("VCI_OpenDevice", "VCI_CloseDevice", "VCI_InitCAN", "VCI_StartCAN", "VCI_Transmit"):
+        getattr(lib, name).restype = u32
+    return lib
+
+
+def zlg_frame(can_id, data, extended):
+    """One classic ControlCAN data frame. SendType 1 sends it once."""
+    data = bytes(data)
+    if len(data) > 8:
+        raise Fail("%s: ZLG ask is Classic CAN, 8 bytes." % ADAPTER_LABEL)
+    obj = VciCanObj()
+    obj.ID = can_id & (0x1FFFFFFF if extended else 0x7FF)
+    obj.SendType = 1
+    obj.RemoteFlag = 0
+    obj.ExternFlag = 1 if extended else 0
+    obj.DataLen = len(data)
+    for i, b in enumerate(data):
+        obj.Data[i] = b
+    return obj
+
+
+class ZlgBus:
+    """ZLG ControlCAN (USBCAN and the same vendor USB-CAN API).
+
+    send() uses the same ask-only guard as Peak. Device type 4 is USBCAN2;
+    pass --dev-type for another ZLG model.
+    """
+
+    name = "zlg"
+
+    def __init__(self, lib=None, lib_path="", dev_type=4, dev_index=0, channel=0):
+        self.lib = lib
+        self.lib_path = lib_path
+        self.dev_type = int(dev_type)
+        self.dev_index = int(dev_index)
+        self.channel = int(channel)
+        self.opened = False
+        self.listening = False
+        self.transmitting = False
+        self.classic = False
+        self.bitrate = 0
+
+    def open_listen(self, classic=False, bitrate=500000):
+        self._open(classic, bitrate, listen=True)
+
+    def open_transmit(self, classic=False, bitrate=500000):
+        self._open(classic, bitrate, listen=False)
+
+    def _ensure_lib(self):
+        if self.lib is not None:
+            return
+        path = self.lib_path or default_zlg_lib()
+        if not path:
+            raise Fail(
+                "%s: ZLG ControlCAN library not found. Set WR_ZLG_LIB, or use "
+                "--adapter peak or --adapter socketcan --iface can0." % ADAPTER_LABEL
+            )
+        self.lib = load_zlg(path)
+
+    def _open(self, classic, bitrate, listen):
+        if not classic:
+            raise Fail("%s: ZLG ask is Classic CAN. Use send --uds or pass --classic." % ADAPTER_LABEL)
+        if bitrate not in ZLG_TIMING:
+            raise Fail("bitrate must be 1000000, 500000, 250000 or 125000")
+        self._ensure_lib()
+        if self.lib.VCI_OpenDevice(self.dev_type, self.dev_index, 0) != 1:
+            raise Fail("%s: ZLG OpenDevice failed. Check the USB-CAN box." % ADAPTER_LABEL)
+        self.opened = True
+        timing = ZLG_TIMING[bitrate]
+        cfg = VciInit()
+        cfg.AccCode = 0
+        cfg.AccMask = 0xFFFFFFFF
+        cfg.Filter = 1
+        cfg.Timing0 = timing[0]
+        cfg.Timing1 = timing[1]
+        cfg.Mode = 1 if listen else 0
+        if self.lib.VCI_InitCAN(self.dev_type, self.dev_index, self.channel, ctypes.byref(cfg)) != 1:
+            self.close()
+            raise Fail("%s: ZLG InitCAN failed." % ADAPTER_LABEL)
+        if self.lib.VCI_StartCAN(self.dev_type, self.dev_index, self.channel) != 1:
+            self.close()
+            raise Fail("%s: ZLG StartCAN failed." % ADAPTER_LABEL)
+        self.listening = listen
+        self.transmitting = not listen
+        self.classic = True
+        self.bitrate = bitrate
+
+    def send(self, can_id, data, extended=False, fd=False, brs=False):
+        data = guard_transmit(self, can_id, data, extended)
+        if fd or len(data) > 8:
+            raise Fail("%s: ZLG ask is Classic CAN, 8 bytes." % ADAPTER_LABEL)
+        if self.lib is None or not self.opened:
+            raise Fail("%s is not open." % ADAPTER_LABEL)
+        obj = zlg_frame(can_id, data, extended)
+        sent = self.lib.VCI_Transmit(self.dev_type, self.dev_index, self.channel, ctypes.byref(obj), 1)
+        if sent != 1:
+            raise Fail("%s: ZLG Transmit failed." % ADAPTER_LABEL)
+
+    def close(self):
+        if self.lib is not None and self.opened:
+            self.lib.VCI_CloseDevice(self.dev_type, self.dev_index)
+        self.opened = False
+        self.listening = False
+        self.transmitting = False
+
+
+def socketcan_frame(can_id, data, extended):
+    """Linux can_frame. The extended bit is CAN_EFF_FLAG, not part of the id."""
+    data = bytes(data)
+    if len(data) > 8:
+        raise Fail("%s: SocketCAN ask is Classic CAN, 8 bytes." % ADAPTER_LABEL)
+    ident = can_id & (0x1FFFFFFF if extended else 0x7FF)
+    if extended:
+        ident |= CAN_EFF_FLAG
+    return struct.pack("=IB3x8s", ident, len(data), data.ljust(8, b"\x00"))
+
+
+def _socketcan_bitrate(iface):
+    try:
+        with open("/sys/class/net/%s/can_bittiming/bitrate" % iface, encoding="ascii") as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _socketcan_present(iface):
+    try:
+        with open("/sys/class/net/%s/type" % iface, encoding="ascii") as handle:
+            return int(handle.read().strip()) == 280
+    except (OSError, ValueError):
+        return False
+
+
+class SocketCanBus:
+    """SocketCAN. Covers USB-CAN devices the OS exposes as a can interface.
+
+    That includes Peak and ZLG kernel drivers, and other vendor USB-CAN boxes.
+    The interface must already be up. UDS still requires classic 500 kbit/s.
+    """
+
+    name = "socketcan"
+
+    def __init__(self, iface="can0"):
+        self.iface = iface or "can0"
+        self.sock = None
+        self.listening = False
+        self.transmitting = False
+        self.classic = False
+        self.bitrate = 0
+
+    def open_listen(self, classic=False, bitrate=500000):
+        self._open(classic, bitrate, listen=True)
+
+    def open_transmit(self, classic=False, bitrate=500000):
+        self._open(classic, bitrate, listen=False)
+
+    def _open(self, classic, bitrate, listen):
+        if not hasattr(socket, "PF_CAN") or not hasattr(socket, "CAN_RAW"):
+            raise Fail("%s: SocketCAN is not on this system. Use --adapter peak or --adapter zlg." % ADAPTER_LABEL)
+        if bitrate not in BTR:
+            raise Fail("bitrate must be 1000000, 500000, 250000 or 125000")
+        actual = _socketcan_bitrate(self.iface)
+        if actual is not None and actual != bitrate:
+            raise Fail(
+                "%s: SocketCAN %s is %d bit/s, not %d."
+                % (ADAPTER_LABEL, self.iface, actual, bitrate)
+            )
+        try:
+            sock = socket.socket(socket.PF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+            sock.bind((self.iface,))
+        except OSError as exc:
+            raise Fail(
+                "%s: SocketCAN %s is not open (%s)."
+                % (ADAPTER_LABEL, self.iface, getattr(exc, "strerror", None) or exc)
+            )
+        self.sock = sock
+        self.listening = listen
+        self.transmitting = not listen
+        self.classic = bool(classic)
+        self.bitrate = bitrate
+
+    def send(self, can_id, data, extended=False, fd=False, brs=False):
+        data = guard_transmit(self, can_id, data, extended)
+        if fd or len(data) > 8:
+            raise Fail("%s: SocketCAN ask is Classic CAN, 8 bytes." % ADAPTER_LABEL)
+        if self.sock is None:
+            raise Fail("%s is not open." % ADAPTER_LABEL)
+        try:
+            self.sock.send(socketcan_frame(can_id, data, extended))
+        except OSError as exc:
+            raise Fail("%s: SocketCAN send failed (%s)." % (ADAPTER_LABEL, getattr(exc, "strerror", None) or exc))
+
+    def close(self):
+        sock = self.sock
+        self.sock = None
+        self.listening = False
+        self.transmitting = False
+        if sock is not None:
+            sock.close()
+
+
+ADAPTER_ALIASES = {
+    "peak": "peak",
+    "pcan": "peak",
+    "pcan-basic": "peak",
+    "pcanbasic": "peak",
+    "zlg": "zlg",
+    "controlcan": "zlg",
+    "socketcan": "socketcan",
+    "socket-can": "socketcan",
+}
+
+
+def resolve_adapter(adapter, iface=""):
+    """auto picks an explicit env, then a library that is installed, else Peak."""
+    kind = (adapter or "auto").strip().lower()
+    if kind != "auto":
+        if kind not in ADAPTER_ALIASES:
+            raise Fail("%s: unknown adapter %r. Use peak, zlg, or socketcan." % (ADAPTER_LABEL, adapter))
+        return ADAPTER_ALIASES[kind]
+    env = (os.environ.get("WR_CAN_ADAPTER") or "").strip().lower()
+    if env:
+        if env not in ADAPTER_ALIASES:
+            raise Fail("%s: unknown adapter %r. Use peak, zlg, or socketcan." % (ADAPTER_LABEL, env))
+        return ADAPTER_ALIASES[env]
+    if iface or os.environ.get("WR_CAN_IFACE"):
+        return "socketcan"
+    if default_lib():
+        return "peak"
+    if default_zlg_lib():
+        return "zlg"
+    if _socketcan_present(iface or os.environ.get("WR_CAN_IFACE") or "can0"):
+        return "socketcan"
+    return "peak"
+
+
+def open_can_port(adapter="auto", lib_path="", iface="", dev_type=4, dev_index=0, channel=0):
+    kind = resolve_adapter(adapter, iface)
+    if kind == "peak":
+        return PeakBus(lib_path=lib_path)
+    if kind == "zlg":
+        return ZlgBus(lib_path=lib_path, dev_type=dev_type, dev_index=dev_index, channel=channel)
+    return SocketCanBus(iface or os.environ.get("WR_CAN_IFACE") or "can0")
 
 
 def _keys(name):
@@ -1154,7 +1481,15 @@ def _cmd_send(argv):
     print(BUS_NOTE)
     if any(_uds_ask_frame(data) for _can_id, data, _ext in frames):
         print(UDS_BUS_NOTE)
-    bus = PeakBus(lib_path=_opt(argv, "--lib", ""))
+    bus = open_can_port(
+        _opt(argv, "--adapter", "auto"),
+        lib_path=_opt(argv, "--lib", ""),
+        iface=_opt(argv, "--iface", ""),
+        dev_type=int(_opt(argv, "--dev-type", "4"), 0),
+        dev_index=int(_opt(argv, "--dev-index", "0"), 0),
+        channel=int(_opt(argv, "--channel", "0"), 0),
+    )
+    print("%s: %s" % (ADAPTER_LABEL, bus.name))
     bus.open_transmit(classic=classic, bitrate=bitrate)
     try:
         for can_id, data, ext in frames:
@@ -1168,12 +1503,15 @@ def _cmd_send(argv):
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print("可以问，不能改")
+        print("CAN adapter (Peak, ZLG, …). --adapter peak|zlg|socketcan")
         print("plot FILE.asc [--dbc FILE]")
         print("j1939 FILE.asc")
         print("decode FILE.asc [--dbc FILE]")
         print("dbc set FILE.dbc")
         print("send    ask the standard J1979 questions (speed, fault codes, VIN)")
         print("send --uds    WH13 UDS poll on 29-bit 0x18DBFFF1 (classic 500 kbit/s)")
+        print("send --uds --adapter socketcan --iface can0")
+        print("send --uds --adapter zlg    ZLG ControlCAN, classic 500 kbit/s")
         print("send --uds --target 10    same poll, physical 0x18DA10F1")
         print("send --id 18DBFFF1 --data 02 10 03 --classic    extended session, a read")
         print("send --id 7DF --data 02 01 0D    J1979 legacy read; UDS is not sent on 7DF")

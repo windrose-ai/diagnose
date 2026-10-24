@@ -3,6 +3,7 @@
 # Unit tests for canbench.py. No adapter and no network.
 import io
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -52,6 +53,7 @@ class DecodeTests(unittest.TestCase):
         self.assertIn("<svg", page)
         self.assertIn("#f6f5f2", page)
         self.assertIn("可以问，不能改", page)
+        self.assertIn("CAN adapter (Peak, ZLG, …)", page)
         self.assertIn("VehicleSpeed", page)
         self.assertNotIn("EngineSpeed", page)
 
@@ -324,6 +326,7 @@ class DecodeTests(unittest.TestCase):
             self.assertEqual(cb.main(["send", "--id", "18DAF110", "--data", "02 3E 00", "--classic"]), 2)
             self.assertEqual(cb.main(["send", "--id", "CF00400", "--data", "03 22 F1 90", "--classic", "--extended"]), 2)
             self.assertEqual(cb.main(["send", "--uds", "--target", "F1"]), 2)
+            self.assertEqual(cb.main(["send", "--uds", "--adapter", "nope"]), 2)
             self.assertEqual(opened, [])
             self.assertEqual(cb.main(["send", "--uds"]), 0)
             self.assertEqual(cb.main(["send", "--uds", "--target", "10"]), 0)
@@ -345,6 +348,48 @@ class DecodeTests(unittest.TestCase):
             self.assertEqual(cb.main([]), 0)
         self.assertIn("可以问，不能改", buf.getvalue())
         self.assertIn("18DBFFF1", buf.getvalue())
+        self.assertIn("CAN adapter (Peak, ZLG, …)", buf.getvalue())
+
+    def test_adapters_share_the_ask_allowlist(self):
+        self.assertIsInstance(cb.open_can_port("auto"), cb.PeakBus)
+        self.assertIsInstance(cb.open_can_port("pcan-basic"), cb.PeakBus)
+        self.assertIsInstance(cb.open_can_port("zlg"), cb.ZlgBus)
+        self.assertIsInstance(cb.open_can_port("socketcan", iface="can0"), cb.SocketCanBus)
+        with self.assertRaises(cb.Fail):
+            cb.open_can_port("nope")
+        raw = cb.socketcan_frame(0x18DBFFF1, bytes.fromhex("021003"), True)
+        ident, dlc = struct.unpack_from("=IB", raw)
+        self.assertEqual(ident, 0x18DBFFF1 | cb.CAN_EFF_FLAG)
+        self.assertEqual(dlc, 3)
+        obj = cb.zlg_frame(0x18DA10F1, bytes.fromhex("023E00"), True)
+        self.assertEqual(obj.ID, 0x18DA10F1)
+        self.assertEqual(obj.ExternFlag, 1)
+        self.assertEqual(obj.RemoteFlag, 0)
+        self.assertEqual(obj.SendType, 1)
+        self.assertEqual(obj.DataLen, 3)
+        self.assertEqual(bytes(obj.Data[:3]), bytes.fromhex("023E00"))
+        good = cb.uds_read_frames("extended")[0]
+        blocked = (
+            bytes.fromhex("022701"),
+            bytes.fromhex("021002"),
+            bytes.fromhex("032EF190"),
+            bytes.fromhex("032FF190"),
+            bytes.fromhex("023101"),
+            bytes.fromhex("023400"),
+            bytes.fromhex("0136"),
+            bytes.fromhex("0137"),
+        )
+        for port in (cb.PeakBus(), cb.ZlgBus(), cb.SocketCanBus("can0")):
+            port.transmitting = True
+            port.classic = True
+            port.bitrate = cb.DIAGNOSTIC_BITRATE
+            for data in blocked:
+                with self.assertRaises(cb.Fail) as caught:
+                    port.send(0x18DBFFF1, data, extended=True)
+                self.assertIn("可以问，不能改", str(caught.exception))
+            with self.assertRaises(cb.Fail) as caught:
+                port.send(*good)
+            self.assertNotIn("可以问，不能改", str(caught.exception))
 
 
 if __name__ == "__main__":

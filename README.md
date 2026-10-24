@@ -8,9 +8,12 @@ DBC that you supply.
 
 ## Design principles
 
-- **可以问，不能改。** Peak (PCAN) may transmit on the diagnostic CAN only:
+- **可以问，不能改。** A CAN adapter (Peak, ZLG, …) may transmit on the diagnostic CAN only:
   OBD pins 6 and 14, classic CAN at 500 kbit/s, via TGW / GWCANFD9.
-  Recording stays listen-only.
+  `send --uds --adapter peak`, `--adapter zlg`, or `--adapter socketcan --iface can0`.
+  PCAN-Basic also covers other devices that ship that library. SocketCAN covers
+  USB-CAN boxes the OS exposes as a can interface, including Peak and ZLG kernel
+  drivers and other vendor adapters. Recording stays listen-only.
 - **WH13 / E700 UDS ids (29-bit).** `send --uds` asks on functional `0x18DBFFF1`
   (tester source `0xF1`). `send --uds --target xx` asks on physical `0x18DAxxF1`.
   Responses come back on `0x18DAF1xx` and are never transmitted. 11-bit `0x7DF`
@@ -49,7 +52,7 @@ python3 canbench.py            # run the CLI
 python3 canbench_test.py       # run the tests
 ```
 
-Hardware: tested with PCAN-USB FD (note: PCAN-USB FD does not speak CAN XL).
+Hardware: any Classic CAN adapter at about 500 kbit/s. Peak (PCAN-Basic), ZLG (ControlCAN), and SocketCAN are built in. PCAN-USB FD does not speak CAN XL.
 
 ## Scope and safety
 

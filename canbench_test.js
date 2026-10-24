@@ -37,6 +37,8 @@ assert.ok(page.indexOf("<svg") >= 0);
 assert.ok(page.indexOf("#f6f5f2") >= 0);
 assert.ok(page.indexOf("可以问，不能改") >= 0);
 assert.strictEqual(cb.policy, "可以问，不能改");
+assert.strictEqual(cb.adapterLabel, "CAN adapter (Peak, ZLG, …)");
+assert.ok(page.indexOf(cb.adapterLabel) >= 0);
 assert.ok(page.indexOf("VehicleSpeed") >= 0);
 assert.strictEqual(page.indexOf("EngineSpeed"), -1);
 assert.strictEqual(cb.isInquiry(0x7DF, [0x02, 0x01, 0x0D], false), true);

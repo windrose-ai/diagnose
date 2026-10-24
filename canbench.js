@@ -2,7 +2,7 @@
 // Copyright 2026 Windrose
 /* Local CAN bench for the Windrose read page. Same rules as canbench.py.
    A DBC stays in this browser. Outbound frames are read-only questions.
-   CAN XL is not implemented. CANBENCH_REV 2026-10-24.1 */
+   CAN adapter (Peak, ZLG, …). CAN XL is not implemented. CANBENCH_REV 2026-10-24.2 */
 (function (root, factory) {
   var api = factory();
   if (typeof module !== "undefined" && module.exports) module.exports = api;
@@ -27,6 +27,7 @@
     0x83:1, 0x84:1, 0x85:1, 0x86:1, 0x87:1
   };
   var POLICY = "可以问，不能改";
+  var ADAPTER_LABEL = "CAN adapter (Peak, ZLG, …)";
   function serviceIsRead(payload) {
     if (!payload || !payload.length) return false;
     var sid = payload[0] & 255;
@@ -225,7 +226,7 @@
       "svg{background:#fff;border:1px solid #ddd;display:block;margin:8px 0 20px}" +
       "p.policy{font-weight:600;color:#1c1c1c}p.note{color:#555}</style></head><body><h1>" +
       esc(title || "CAN plot") + "</h1><p class=\"policy\">" + POLICY +
-      "</p><p class=\"note\">Local file. It is not sent to the assistant. Read-only questions only; the vehicle is not changed.</p>";
+      "</p><p class=\"note\">" + ADAPTER_LABEL + ". Local file. It is not sent to the assistant. Read-only questions only; the vehicle is not changed.</p>";
     if (!series.length) html += "<p>No signal in this recording changed value.</p>";
     series.forEach(function (s) {
       var pts = s.pts, t0 = pts[0].t, t1 = pts[pts.length - 1].t;
@@ -391,6 +392,7 @@
 
   return {
     policy: POLICY,
+    adapterLabel: ADAPTER_LABEL,
     isInquiry: isInquiry,
     serviceIsRead: serviceIsRead,
     udsReadFrames: udsReadFrames,
