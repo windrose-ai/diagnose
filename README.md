@@ -1,6 +1,6 @@
 # Windrose Diagnose
 
-**可以问，不能改。** Windrose Diagnose listens, and it may ask a read-only diagnostic question. It never writes to the vehicle.
+**You can ask. You cannot change.** 可以问，不能改。 Windrose Diagnose listens, and it may ask a read-only diagnostic question. It never writes to the vehicle.
 
 Windrose Diagnose connects to a vehicle CAN bus to **read** — vehicle speed, fault
 codes, VIN, software and component identifiers — plots signals, and decodes a
@@ -58,7 +58,7 @@ Hardware: plug in a USB-CAN dongle. Peak, ZLG, SocketCAN, and other USB-CAN devi
 
 ## Scope and safety
 
-可以问，不能改。This tool asks read-only diagnostic questions on the diagnostic
+You can ask. You cannot change. 可以问，不能改。 This tool asks read-only diagnostic questions on the diagnostic
 CAN and never writes, flashes, unlocks, or commands the vehicle. Use it on
 buses and vehicles you are authorized to access.
 

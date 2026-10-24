@@ -35,8 +35,8 @@ var page = cb.plotHtml([
 ], dbc, "t");
 assert.ok(page.indexOf("<svg") >= 0);
 assert.ok(page.indexOf("#f6f5f2") >= 0);
-assert.ok(page.indexOf("可以问，不能改") >= 0);
-assert.strictEqual(cb.policy, "可以问，不能改");
+assert.ok(page.indexOf("You can ask. You cannot change.") < page.indexOf("可以问，不能改"));
+assert.strictEqual(cb.policy, "You can ask. You cannot change. 可以问，不能改");
 assert.strictEqual(cb.adapterLabel, "CAN adapter (Peak, ZLG, …)");
 assert.ok(page.indexOf(cb.adapterLabel) >= 0);
 assert.ok(page.indexOf("VehicleSpeed") >= 0);
@@ -72,11 +72,11 @@ assert.strictEqual(cb.plainAdapterName({ vid: 0x0471, pid: 0x1200 }), "ZLG USBCA
 assert.strictEqual(cb.plainAdapterName({ vid: 0x1234, pid: 0xabcd }), "unknown USB-CAN, VID:PID 1234:abcd");
 var opened = cb.connectPage(
   [{ vid: 0x1234, pid: 0xabcd }, { vid: 0x0c72, pid: 0x000c }],
-  ["可以问，不能改。"]
+  ["You can ask. You cannot change. 可以问，不能改"]
 );
 assert.ok(opened.indexOf("unknown USB-CAN, VID:PID 1234:abcd") >= 0);
 assert.ok(opened.indexOf("Peak PCAN-USB") >= 0);
-assert.ok(opened.indexOf("可以问，不能改") >= 0);
+assert.ok(opened.indexOf("You can ask. You cannot change.") < opened.indexOf("可以问，不能改"));
 assert.ok(opened.indexOf("do not need to know the brand") >= 0);
 assert.strictEqual(cb.connectPage([], []).indexOf("Nothing is plugged in") >= 0, true);
 assert.strictEqual(cb.isInquiry(0x7E0, [0x30, 0x00, 0x00], false), true);

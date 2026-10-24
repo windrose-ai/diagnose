@@ -20,7 +20,7 @@ import struct
 import sys
 import time
 
-CANBENCH_REV = "2026-10-24.3"
+CANBENCH_REV = "2026-10-24.4"
 ADAPTER_LABEL = "CAN adapter (Peak, ZLG, …)"
 CH1 = 0x51  # PCAN_USBBUS1
 LISTEN_ONLY = 0x08
@@ -82,10 +82,11 @@ WH13_FUNCTIONAL = 0x18DBFFF1
 # J1979 legacy only. UDS asks are not sent on these ids.
 J1979_FUNCTIONAL = 0x7DF
 J1979_FUNCTIONAL_EXT = 0x18DB33F1
-ASK_ONLY = "可以问，不能改"
+ASK_ONLY = "You can ask. You cannot change. 可以问，不能改"
 BUS_NOTE = (
-    "可以问，不能改。Asking only. Nothing on the truck is changed. "
-    "CAN XL is not available on PCAN-USB FD."
+    "Asking only. Nothing on the truck is changed. "
+    "CAN XL is not available on PCAN-USB FD. "
+    "可以问，不能改。"
 )
 UDS_BUS_NOTE = (
     "UDS asks go out on the diagnostic CAN only "
@@ -127,8 +128,9 @@ BLOCKED_SERVICES = frozenset((
     0x87,  # LinkControl
 ))
 NOT_A_QUESTION = (
-    "可以问，不能改。This frame is not a read-only question. "
-    "Clear, reset, write, flash, security access, and control are not sent."
+    "This frame is not a read-only question. "
+    "Clear, reset, write, flash, security access, and control are not sent. "
+    "可以问，不能改。"
 )
 
 
@@ -644,7 +646,9 @@ def plot_html(frames, dbc, title="CAN plot"):
         "p.note{color:#555}",
         "</style></head><body><h1>",
         html.escape(title),
-        "</h1><p class=\"policy\">可以问，不能改</p>",
+        "</h1><p class=\"policy\">",
+        html.escape(ASK_ONLY),
+        "</p>",
         "<p class=\"note\">",
         "Plug in a USB-CAN dongle. You do not need to know the brand. ",
         ADAPTER_LABEL,
@@ -1442,7 +1446,8 @@ PLAIN_POWER = (
     "Turn the ignition on and check OBD pins 6 and 14."
 )
 PLAIN_BOUNDARY = (
-    "可以问，不能改。This tool only asks for data. It will not write, flash, unlock, or command the vehicle."
+    "This tool only asks for data. It will not write, flash, unlock, or command the vehicle. "
+    "可以问，不能改。"
 )
 
 
@@ -1682,7 +1687,7 @@ def connect_html(found, lines):
         "<style>body{background:#f6f5f2;color:#1c1c1c;font:15px -apple-system,sans-serif;margin:24px}",
         "p.policy{font-weight:600}li{margin:6px 0}</style></head><body>",
         "<h1>Windrose Diagnose</h1>",
-        "<p class=\"policy\">可以问，不能改</p>",
+        "<p class=\"policy\">%s</p>" % html.escape(ASK_ONLY),
         "<p>Plug in a USB-CAN dongle. You do not need to know the brand.</p>",
     ]
     if not found and not any(PLAIN_NOTHING in (line or "") for line in lines):
@@ -1702,7 +1707,7 @@ def run_connect(found=None, open_port=None, libs=None):
     """Enumerate, name, and when a dongle is ready ask read-only UDS at classic 500 kbit/s."""
     if found is None:
         found = enumerate_adapters(libs=libs)
-    lines = ["可以问，不能改。"]
+    lines = [ASK_ONLY]
     asked = []
     heard = []
     if not found:
@@ -1931,7 +1936,7 @@ def _cmd_connect(argv):
 
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
-        print("可以问，不能改")
+        print(ASK_ONLY)
         print("Plug in a USB-CAN dongle, then: connect")
         print("You do not need to know if it is Peak, ZLG, or another brand.")
         print(ADAPTER_LABEL)

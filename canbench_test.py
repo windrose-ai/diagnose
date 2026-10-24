@@ -52,7 +52,7 @@ class DecodeTests(unittest.TestCase):
         page = cb.plot_html(cb.load_asc(ASC), dbc)
         self.assertIn("<svg", page)
         self.assertIn("#f6f5f2", page)
-        self.assertIn("可以问，不能改", page)
+        self.assertLess(page.find("You can ask. You cannot change."), page.find("可以问，不能改"))
         self.assertIn("CAN adapter (Peak, ZLG, …)", page)
         self.assertIn("VehicleSpeed", page)
         self.assertNotIn("EngineSpeed", page)
@@ -346,8 +346,10 @@ class DecodeTests(unittest.TestCase):
         buf = io.StringIO()
         with redirect_stdout(buf):
             self.assertEqual(cb.main([]), 0)
-        self.assertIn("可以问，不能改", buf.getvalue())
-        self.assertIn("18DBFFF1", buf.getvalue())
+        help_text = buf.getvalue()
+        self.assertTrue(help_text.startswith("You can ask. You cannot change."))
+        self.assertLess(help_text.find("You can ask"), help_text.find("可以问，不能改"))
+        self.assertIn("18DBFFF1", help_text)
         self.assertIn("CAN adapter (Peak, ZLG, …)", buf.getvalue())
 
     def test_adapters_share_the_ask_allowlist(self):
@@ -386,7 +388,9 @@ class DecodeTests(unittest.TestCase):
             for data in blocked:
                 with self.assertRaises(cb.Fail) as caught:
                     port.send(0x18DBFFF1, data, extended=True)
-                self.assertIn("可以问，不能改", str(caught.exception))
+                message = str(caught.exception)
+                self.assertTrue(message.startswith("This frame is not a read-only question."))
+                self.assertLess(message.find("This frame"), message.find("可以问，不能改"))
             with self.assertRaises(cb.Fail) as caught:
                 port.send(*good)
             self.assertNotIn("可以问，不能改", str(caught.exception))
@@ -485,6 +489,7 @@ class DecodeTests(unittest.TestCase):
             self.assertTrue(cb.is_inquiry(can_id, data, ext))
             self.assertNotIn(data[1], cb.BLOCKED_SERVICES)
         text = "\n".join(report["lines"])
+        self.assertTrue(text.startswith("You can ask. You cannot change."))
         self.assertIn("Peak PCAN-USB", text)
         self.assertIn("data value", text)
         self.assertIn("public dictionary", text)
@@ -504,10 +509,10 @@ class DecodeTests(unittest.TestCase):
         self.assertIn(cb.PLAIN_POWER, "\n".join(powered["lines"]))
         page = cb.connect_html(
             [{"plain": "unknown USB-CAN, VID:PID 1234:abcd"}],
-            ["可以问，不能改。"],
+            [cb.ASK_ONLY],
         )
         self.assertIn("unknown USB-CAN, VID:PID 1234:abcd", page)
-        self.assertIn("可以问，不能改", page)
+        self.assertLess(page.find("You can ask. You cannot change."), page.find("可以问，不能改"))
         self.assertIn("do not need to know the brand", page)
         real_enum = cb.enumerate_adapters
         cb.enumerate_adapters = lambda *args, **kwargs: []

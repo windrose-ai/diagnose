@@ -3,7 +3,7 @@
 /* Local CAN bench for the Windrose read page. Same rules as canbench.py.
    A DBC stays in this browser. Outbound frames are read-only questions.
    On open, name the dongle. You do not pick Peak or ZLG.
-   CAN XL is not implemented. CANBENCH_REV 2026-10-24.3 */
+   CAN XL is not implemented. CANBENCH_REV 2026-10-24.4 */
 (function (root, factory) {
   var api = factory();
   if (typeof module !== "undefined" && module.exports) module.exports = api;
@@ -27,7 +27,7 @@
     0x2E:1, 0x2F:1, 0x31:1, 0x34:1, 0x35:1, 0x36:1, 0x37:1, 0x38:1, 0x3D:1,
     0x83:1, 0x84:1, 0x85:1, 0x86:1, 0x87:1
   };
-  var POLICY = "可以问，不能改";
+  var POLICY = "You can ask. You cannot change. 可以问，不能改";
   var ADAPTER_LABEL = "CAN adapter (Peak, ZLG, …)";
   function serviceIsRead(payload) {
     if (!payload || !payload.length) return false;
