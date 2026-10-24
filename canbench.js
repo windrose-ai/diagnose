@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Windrose
 /* Local CAN bench for the Windrose read page. Same rules as canbench.py.
-   A DBC stays in this browser. Outbound frames are questions only.
-   CAN XL is not implemented. CANBENCH_REV 2026-10-05.1 */
+   A DBC stays in this browser. Outbound frames are read-only questions.
+   CAN XL is not implemented. CANBENCH_REV 2026-10-24.1 */
 (function (root, factory) {
   var api = factory();
   if (typeof module !== "undefined" && module.exports) module.exports = api;
@@ -18,7 +18,47 @@
   var READ_PGN = {65226:1, 65227:1, 65229:1, 65230:1, 65231:1, 65236:1, 65260:1, 65259:1, 65242:1, 60928:1};
   var READ_NAME = {dm1:65226, dm2:65227, dm4:65229, dm5:65230, dm6:65231, dm12:65236, vin:65260, component:65259, software:65242, address:60928};
 
-  var READ = {0x01:1, 0x02:1, 0x03:1, 0x05:1, 0x06:1, 0x07:1, 0x09:1, 0x0A:1, 0x19:1, 0x22:1};
+  var UDS_ASK = {0x10:1, 0x19:1, 0x22:1, 0x3E:1};
+  var OBD_READ = {0x01:1, 0x02:1, 0x03:1, 0x05:1, 0x06:1, 0x07:1, 0x09:1, 0x0A:1};
+  var BLOCKED = {
+    0x04:1, 0x08:1, 0x11:1, 0x14:1, 0x27:1, 0x28:1, 0x29:1, 0x2A:1, 0x2C:1,
+    0x2E:1, 0x2F:1, 0x31:1, 0x34:1, 0x35:1, 0x36:1, 0x37:1, 0x38:1, 0x3D:1,
+    0x83:1, 0x84:1, 0x85:1, 0x86:1, 0x87:1
+  };
+  var POLICY = "可以问，不能改";
+  function serviceIsRead(payload) {
+    if (!payload || !payload.length) return false;
+    var sid = payload[0] & 255;
+    if (BLOCKED[sid] || (!UDS_ASK[sid] && !OBD_READ[sid])) return false;
+    if (sid === 0x10) {
+      if (payload.length !== 2) return false;
+      var session = payload[1] & 0x7f;
+      return session === 0x01 || session === 0x03;
+    }
+    if (sid === 0x3e) {
+      if (payload.length !== 2) return false;
+      return (payload[1] & 0x7f) === 0x00;
+    }
+    if (sid === 0x22) return payload.length >= 3 && ((payload.length - 1) % 2) === 0;
+    if (sid === 0x19) return payload.length >= 2 && (payload[1] & 0x7f) !== 0;
+    return !!OBD_READ[sid];
+  }
+  function udsReadFrames(session) {
+    var which = session || "extended";
+    var sub = which === "default" ? 0x01 : 0x03;
+    if (which !== "default" && which !== "extended") return null;
+    var bodies = [
+      [0x02, 0x10, sub],
+      [0x02, 0x3e, 0x00],
+      [0x03, 0x22, 0xf1, 0x90],
+      [0x03, 0x19, 0x02, 0xff]
+    ];
+    return bodies.map(function (body) {
+      var data = body.slice();
+      while (data.length < 8) data.push(0);
+      return { id: 0x7df, data: data, ext: false };
+    });
+  }
   function isJ1939ReadRequest(canId, data, extended) {
     var id = canId >>> 0;
     var b = data || [];
@@ -46,7 +86,7 @@
       return true;
     }
     if (pci < 1 || pci > 7 || b.length < 1 + pci) return false;
-    return !!READ[b[1] & 255];
+    return serviceIsRead(b.slice(1, 1 + pci));
   }
   function j1939Request(name) {
     var key = String(name).toLowerCase();
@@ -161,8 +201,10 @@
     function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
     var html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>" + esc(title || "CAN plot") +
       "</title><style>body{background:#f6f5f2;color:#1c1c1c;font:14px -apple-system,sans-serif;margin:24px}" +
-      "svg{background:#fff;border:1px solid #ddd;display:block;margin:8px 0 20px}p.note{color:#555}</style></head><body><h1>" +
-      esc(title || "CAN plot") + "</h1><p class=\"note\">Local file. It is not sent to the assistant.</p>";
+      "svg{background:#fff;border:1px solid #ddd;display:block;margin:8px 0 20px}" +
+      "p.policy{font-weight:600;color:#1c1c1c}p.note{color:#555}</style></head><body><h1>" +
+      esc(title || "CAN plot") + "</h1><p class=\"policy\">" + POLICY +
+      "</p><p class=\"note\">Local file. It is not sent to the assistant. Read-only questions only; the vehicle is not changed.</p>";
     if (!series.length) html += "<p>No signal in this recording changed value.</p>";
     series.forEach(function (s) {
       var pts = s.pts, t0 = pts[0].t, t1 = pts[pts.length - 1].t;
@@ -327,7 +369,10 @@
   }
 
   return {
+    policy: POLICY,
     isInquiry: isInquiry,
+    serviceIsRead: serviceIsRead,
+    udsReadFrames: udsReadFrames,
     j1939Request: j1939Request,
     j1939Dtcs: function (frames) { return collectJ1939(frames).dtcs; },
     pgnParts: pgnParts,

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Windrose
 # Unit tests for canbench.py. No adapter and no network.
+import io
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import canbench as cb
@@ -49,6 +51,7 @@ class DecodeTests(unittest.TestCase):
         page = cb.plot_html(cb.load_asc(ASC), dbc)
         self.assertIn("<svg", page)
         self.assertIn("#f6f5f2", page)
+        self.assertIn("可以问，不能改", page)
         self.assertIn("VehicleSpeed", page)
         self.assertNotIn("EngineSpeed", page)
 
@@ -115,6 +118,7 @@ class DecodeTests(unittest.TestCase):
             self.assertEqual(cb.main(["send", "--symbol", "Speed.A=1"]), 2)
             self.assertEqual(opened, [])
             self.assertEqual(cb.main(["send", "--id", "7DF", "--data", "01 04"]), 2)
+            self.assertEqual(cb.main(["send", "--id", "7DF", "--data", "02 10 02", "--classic"]), 2)
             self.assertEqual(cb.main(["send", "--id", "7DF", "--data", "02 10 03"]), 2)
             self.assertEqual(cb.main(["send", "--id", "7DF", "--data", "02 01 0D", "--period", "100"]), 2)
             self.assertEqual(opened, [])
@@ -208,6 +212,108 @@ class DecodeTests(unittest.TestCase):
                 self.assertIn("<svg", handle.read())
             self.assertEqual(cb.main(["j1939", asc]), 0)
             self.assertIn("km/h", dbc["messages"][256]["signals"][0]["unit"])
+
+    def test_uds_ask_allowlist_and_hard_block(self):
+        def frame(hex_bytes):
+            body = bytes.fromhex(hex_bytes)
+            return body + bytes(8 - len(body))
+
+        allowed = (
+            "021001", "021003", "021081", "021083",
+            "023E00", "023E80", "0322F190", "031902FF",
+            "02010D", "020902", "0103",
+        )
+        for raw in allowed:
+            self.assertTrue(cb.is_inquiry(0x7DF, frame(raw), False), raw)
+            self.assertTrue(cb.service_is_read(bytes.fromhex(raw)[1:]), raw)
+        self.assertTrue(cb.is_inquiry(0x7E0, frame("0322F191"), False))
+        self.assertTrue(cb.is_inquiry(0x18DB33F1, frame("031902FF"), True))
+        blocked = (
+            "021002", "021082", "021004", "03100300",
+            "022701", "042702AABB", "023E01", "0222F1",
+            "021900", "032EF190", "072EF190010203",
+            "052FF1900300", "0431010203",
+            "07340011223344", "0135", "023601", "0137", "023801",
+            "021101", "0414FFFFFF", "0104", "020800",
+            "03280101", "023D00",
+        )
+        for raw in blocked:
+            self.assertFalse(cb.is_inquiry(0x7DF, frame(raw), False), raw)
+        self.assertFalse(cb.is_inquiry(0x0CF00400, frame("0322F190"), True))
+        self.assertFalse(cb.is_inquiry(0x18DA10F1, frame("021002"), True))
+        passed = []
+        for sid in range(256):
+            probe = bytes((0x02, sid, 0x00)) + bytes(5)
+            if cb.is_inquiry(0x7DF, probe, False):
+                passed.append(sid)
+        self.assertEqual(set(passed), set(cb.OBD_READ_SERVICES) | {0x3E})
+        self.assertTrue(cb.BLOCKED_SERVICES.isdisjoint(cb.UDS_ASK_SERVICES))
+        self.assertTrue(cb.BLOCKED_SERVICES.isdisjoint(cb.OBD_READ_SERVICES))
+        poll = cb.uds_read_frames("extended")
+        self.assertEqual([item[0] for item in poll], [0x7DF] * 4)
+        for can_id, data, ext in poll:
+            self.assertTrue(cb.is_inquiry(can_id, data, ext))
+        self.assertEqual(bytes(poll[0][1][:3]), bytes.fromhex("021003"))
+        self.assertEqual(bytes(poll[1][1][:3]), bytes.fromhex("023E00"))
+        self.assertEqual(bytes(poll[2][1][:4]), bytes.fromhex("0322F190"))
+        self.assertEqual(bytes(poll[3][1][:4]), bytes.fromhex("031902FF"))
+        self.assertEqual(bytes(cb.uds_read_frames("default")[0][1][:3]), bytes.fromhex("021001"))
+        with self.assertRaises(cb.Fail):
+            cb.uds_read_frames("programming")
+        bare = cb.PeakBus()
+        bare.transmitting = True
+        bare.classic = False
+        bare.bitrate = cb.DIAGNOSTIC_BITRATE
+        with self.assertRaises(cb.Fail) as caught:
+            bare.send(0x7DF, bytes.fromhex("021003"), extended=False)
+        self.assertIn("diagnostic CAN", str(caught.exception))
+        bare.classic = True
+        bare.bitrate = 250000
+        with self.assertRaises(cb.Fail):
+            bare.send(0x7DF, bytes.fromhex("021003"), extended=False)
+        bare.bitrate = cb.DIAGNOSTIC_BITRATE
+        with self.assertRaises(cb.Fail):
+            bare.send(0x7DF, bytes.fromhex("022701"), extended=False)
+        with self.assertRaises(cb.Fail):
+            bare.send(0x0CF00400, bytes.fromhex("0322F190"), extended=True)
+        opened = []
+        sent = []
+        real_open, real_send, real_close = cb.PeakBus.open_transmit, cb.PeakBus.send, cb.PeakBus.close
+
+        def fake_open(self, classic=False, bitrate=500000):
+            opened.append((classic, bitrate))
+            self.transmitting = True
+
+        def fake_send(self, can_id, data, extended=False, fd=False, brs=False):
+            if not cb.is_inquiry(can_id, data, extended):
+                raise cb.Fail(cb.NOT_A_QUESTION)
+            sent.append((can_id, bytes(data)))
+
+        cb.PeakBus.open_transmit = fake_open
+        cb.PeakBus.send = fake_send
+        cb.PeakBus.close = lambda self: None
+        try:
+            self.assertEqual(cb.main(["send", "--uds", "--session", "programming"]), 2)
+            self.assertEqual(opened, [])
+            self.assertEqual(cb.main(["send", "--uds", "--bitrate", "250000"]), 2)
+            self.assertEqual(opened, [])
+            self.assertEqual(cb.main(["send", "--id", "7E0", "--data", "02 27 01", "--classic"]), 2)
+            self.assertEqual(cb.main(["send", "--id", "CF00400", "--data", "03 22 F1 90", "--classic", "--extended"]), 2)
+            self.assertEqual(opened, [])
+            self.assertEqual(cb.main(["send", "--uds"]), 0)
+            self.assertEqual(cb.main(["send", "--id", "7E0", "--data", "02 10 03", "--classic"]), 0)
+            self.assertEqual(cb.main(["send", "--id", "7DF", "--data", "02 3E 80", "--classic"]), 0)
+        finally:
+            cb.PeakBus.open_transmit, cb.PeakBus.send, cb.PeakBus.close = real_open, real_send, real_close
+        self.assertEqual(opened, [(True, 500000), (True, 500000), (True, 500000)])
+        self.assertEqual(len(sent), 6)
+        for can_id, data in sent:
+            self.assertTrue(cb.is_inquiry(can_id, data, can_id > 0x7FF))
+            self.assertNotIn(data[1], cb.BLOCKED_SERVICES)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cb.main([]), 0)
+        self.assertIn("可以问，不能改", buf.getvalue())
 
 
 if __name__ == "__main__":

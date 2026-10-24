@@ -2,10 +2,10 @@
 # Copyright 2026 Windrose
 # Local CAN bench for Windrose AI. Python 3.9 standard library only.
 # Plot, a DBC you choose, and J1939 stay on this computer. Nothing here is sent
-# to the assistant. send() transmits a question only. Clear, write, reset,
-# and control frames are refused. Recording stays listen-only.
-# PCAN-USB FD does not speak CAN XL.
-# CANBENCH_REV = "2026-10-05.1"
+# to the assistant. send() may ask a read-only diagnostic question. Clear,
+# write, flash, security access, and control frames are refused.
+# Recording stays listen-only. PCAN-USB FD does not speak CAN XL.
+# CANBENCH_REV = "2026-10-24.1"
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import os
 import re
 import sys
 
-CANBENCH_REV = "2026-10-05.1"
+CANBENCH_REV = "2026-10-24.1"
 CH1 = 0x51  # PCAN_USBBUS1
 LISTEN_ONLY = 0x08
 OK = 0x00000
@@ -67,14 +67,57 @@ TOOL_SA = 0xFE
 MULTI_PG = 0x2500
 FD_TP_CM = 0x4D00
 FD_TP_DT = 0x4E00
+# Diagnostic interface only: OBD pins 6 and 14, classic CAN, via TGW / GWCANFD9.
+# Not the powertrain backbone.
+DIAGNOSTIC_BITRATE = 500000
+DIAGNOSTIC_ID = 0x7DF
+ASK_ONLY = "可以问，不能改"
 BUS_NOTE = (
-    "Asking only. Nothing on the truck is changed. "
+    "可以问，不能改。Asking only. Nothing on the truck is changed. "
     "CAN XL is not available on PCAN-USB FD."
 )
-# OBD/UDS services that read. 0x04 clears faults. 0x08, 0x10, 0x11, 0x14,
-# 0x27, 0x2E, 0x2F, 0x31 and the download services change the truck.
-READ_SERVICES = frozenset((0x01, 0x02, 0x03, 0x05, 0x06, 0x07, 0x09, 0x0A, 0x19, 0x22))
-NOT_A_QUESTION = "This frame is not a question. Clear, reset, write, and control are not sent."
+UDS_BUS_NOTE = (
+    "UDS asks go out on the diagnostic CAN only "
+    "(OBD pins 6/14, classic 500 kbit/s via TGW / GWCANFD9)."
+)
+# Transmit allowlist. A service id that is not listed is refused.
+# Keep these sets in sync with canbench.js.
+# $10 is listed, and only default (0x01) and extended (0x03) sub-functions pass.
+# Programming session (0x02) is the flash entry and is refused below.
+UDS_ASK_SERVICES = frozenset((0x10, 0x19, 0x22, 0x3E))
+# J1979 reads already supported. Mode 01 and 09 are the WH13 pair.
+# Mode 04 (clear) and mode 08 (control) are not in this set.
+OBD_READ_SERVICES = frozenset((0x01, 0x02, 0x03, 0x05, 0x06, 0x07, 0x09, 0x0A))
+# Hard block. Checked before the allowlist. No seed-key, flash, write, or control.
+BLOCKED_SERVICES = frozenset((
+    0x04,  # OBD clear DTCs
+    0x08,  # OBD control of an onboard system
+    0x11,  # ECUReset
+    0x14,  # ClearDiagnosticInformation
+    0x27,  # SecurityAccess
+    0x28,  # CommunicationControl
+    0x29,  # Authentication
+    0x2A,  # ReadDataByPeriodicIdentifier (arms periodic transmit)
+    0x2C,  # DynamicallyDefineDataIdentifier
+    0x2E,  # WriteDataByIdentifier
+    0x2F,  # InputOutputControlByIdentifier
+    0x31,  # RoutineControl
+    0x34,  # RequestDownload
+    0x35,  # RequestUpload
+    0x36,  # TransferData
+    0x37,  # RequestTransferExit
+    0x38,  # RequestFileTransfer
+    0x3D,  # WriteMemoryByAddress
+    0x83,  # AccessTimingParameter
+    0x84,  # SecuredDataTransmission
+    0x85,  # ControlDTCSetting
+    0x86,  # ResponseOnEvent
+    0x87,  # LinkControl
+))
+NOT_A_QUESTION = (
+    "可以问，不能改。This frame is not a read-only question. "
+    "Clear, reset, write, flash, security access, and control are not sent."
+)
 
 
 class Fail(Exception):
@@ -99,27 +142,60 @@ def is_j1939_read_request(can_id, data, extended=False):
     return all(b in (0xFF, 0x00) for b in data[3:])
 
 
+def is_diagnostic_address(can_id, extended=False):
+    """Tester request ids on the diagnostic interface. Not a powertrain backbone id."""
+    n = can_id & 0x1FFFFFFF
+    extended = extended or n > 0x7FF
+    if not extended:
+        return n == DIAGNOSTIC_ID or 0x7E0 <= n <= 0x7E7
+    return n == 0x18DB33F1 or (
+        (n & 0xFFFF00FF) == 0x18DA00F1 and ((n >> 8) & 0xFF) != 0xF1
+    )
+
+
+def service_is_read(payload):
+    """True only for an allowlisted read. payload starts with the service id.
+
+    $10 DiagnosticSessionControl passes for default (0x01) and extended (0x03)
+    only, including the suppress-response bit. Programming session (0x02) does
+    not. $3E TesterPresent passes for sub-function 0x00 only. $22 and $19 are
+    reads. Everything in BLOCKED_SERVICES is refused, including flash,
+    WriteDataByIdentifier, IO control, routine control, and SecurityAccess.
+    """
+    if not payload:
+        return False
+    sid = payload[0]
+    allowed = sid in UDS_ASK_SERVICES or sid in OBD_READ_SERVICES
+    if sid in BLOCKED_SERVICES or not allowed:
+        return False
+    if sid == 0x10:
+        if len(payload) != 2:
+            return False
+        return (payload[1] & 0x7F) in (0x01, 0x03)
+    if sid == 0x3E:
+        if len(payload) != 2:
+            return False
+        return (payload[1] & 0x7F) == 0x00
+    if sid == 0x22:
+        return len(payload) >= 3 and ((len(payload) - 1) % 2) == 0
+    if sid == 0x19:
+        return len(payload) >= 2 and (payload[1] & 0x7F) != 0
+    return sid in OBD_READ_SERVICES
+
+
 def is_inquiry(can_id, data, extended=False):
     """True for a diagnostic question or the flow-control that finishes a read."""
     data = bytes(data)
     if is_j1939_read_request(can_id, data, extended):
         return True
-    n = can_id & 0x1FFFFFFF
-    extended = extended or n > 0x7FF
-    if not extended:
-        ok = n == 0x7DF or 0x7E0 <= n <= 0x7E7
-    else:
-        ok = n == 0x18DB33F1 or (
-            (n & 0xFFFF00FF) == 0x18DA00F1 and ((n >> 8) & 0xFF) != 0xF1
-        )
-    if not ok or len(data) < 2:
+    if not is_diagnostic_address(can_id, extended) or len(data) < 2:
         return False
     pci = data[0]
     if pci == 0x30:
         return len(data) >= 3 and data[1] == 0x00 and data[2] == 0x00 and not any(data[3:])
     if pci < 1 or pci > 7 or len(data) < 1 + pci:
         return False
-    return data[1] in READ_SERVICES
+    return service_is_read(data[1:1 + pci])
 
 
 def j1939_request_pgn(name):
@@ -152,6 +228,13 @@ def j1939_request_frame(name):
     return frame
 
 
+def _pad8(body):
+    body = bytes(body)
+    if len(body) > 8:
+        raise Fail("A read request has to fit in one classic CAN frame.")
+    return body + bytes(8 - len(body))
+
+
 def standard_questions():
     """The same questions the read page asks: supported PIDs, speed, faults, VIN."""
     bodies = [bytes((0x02, 0x01, pid)) for pid in (0x00, 0x20, 0x40, 0x0D, 0x0C, 0x05, 0x04, 0x0F, 0x11, 0x2F, 0x42, 0x5C, 0x5E, 0x1F, 0x01)]
@@ -159,10 +242,47 @@ def standard_questions():
     bodies.append(bytes((0x02, 0x09, 0x02)))
     frames = []
     for body in bodies:
-        pad = body + bytes(8 - len(body))
-        frames.append((0x7DF, pad, False))
+        pad = _pad8(body)
+        frames.append((DIAGNOSTIC_ID, pad, False))
         frames.append((0x18DB33F1, pad, True))
     return frames
+
+
+def uds_read_frames(session="extended"):
+    """One read-only UDS poll on the diagnostic functional id.
+
+    Order: session (default or extended), TesterPresent, VIN by identifier,
+    then stored DTCs. No programming session, no write, no security access.
+    """
+    if session == "default":
+        sub = 0x01
+    elif session == "extended":
+        sub = 0x03
+    else:
+        raise Fail("UDS session must be default or extended. Programming is not a read.")
+    bodies = [
+        bytes((0x02, 0x10, sub)),
+        bytes((0x02, 0x3E, 0x00)),
+        bytes((0x03, 0x22, 0xF1, 0x90)),
+        bytes((0x03, 0x19, 0x02, 0xFF)),
+    ]
+    frames = []
+    for body in bodies:
+        frame = (DIAGNOSTIC_ID, _pad8(body), False)
+        if not is_inquiry(frame[0], frame[1], frame[2]):
+            raise Fail(NOT_A_QUESTION)
+        frames.append(frame)
+    return frames
+
+
+def _uds_ask_frame(data):
+    data = bytes(data)
+    if len(data) < 2:
+        return False
+    pci = data[0]
+    if pci < 1 or pci > 7 or len(data) < 1 + pci:
+        return False
+    return data[1] in UDS_ASK_SERVICES
 
 
 def pgn_parts(can_id):
@@ -451,10 +571,13 @@ def plot_html(frames, dbc, title="CAN plot"):
         "</title><style>",
         "body{background:#f6f5f2;color:#1c1c1c;font:14px -apple-system,BlinkMacSystemFont,sans-serif;margin:24px}",
         "svg{background:#fff;border:1px solid #ddd;display:block;margin:8px 0 20px}",
+        "p.policy{font-weight:600;color:#1c1c1c}",
         "p.note{color:#555}",
         "</style></head><body><h1>",
         html.escape(title),
-        "</h1><p class=\"note\">Local file. It is not sent to the assistant.</p>",
+        "</h1><p class=\"policy\">可以问，不能改</p>",
+        "<p class=\"note\">Local file. It is not sent to the assistant. ",
+        "Read-only questions only; the vehicle is not changed.</p>",
     ]
     if not series:
         parts.append("<p>No signal in this recording changed value.</p>")
@@ -733,13 +856,19 @@ def default_lib():
 
 
 class PeakBus:
-    """PEAK adapter. open_listen records. open_transmit opens the channel for send."""
+    """PEAK adapter. open_listen records and does not transmit.
+
+    open_transmit asks on the diagnostic interface. send() still refuses any
+    frame that is not an allowlisted read.
+    """
 
     def __init__(self, lib=None, lib_path=""):
         self.lib = lib
         self.lib_path = lib_path
         self.listening = False
         self.transmitting = False
+        self.classic = False
+        self.bitrate = 0
 
     def arm(self, word=""):
         """Kept so older callers can run. Transmit no longer waits on this word."""
@@ -780,6 +909,8 @@ class PeakBus:
                 raise Fail("The adapter did not confirm listen-only. Nothing was opened for transmit.")
         self.listening = listen
         self.transmitting = not listen
+        self.classic = bool(classic)
+        self.bitrate = bitrate
 
     def send(self, can_id, data, extended=False, fd=False, brs=False):
         if not self.transmitting:
@@ -787,6 +918,8 @@ class PeakBus:
         data = bytes(data)
         if not is_inquiry(can_id, data, extended):
             raise Fail(NOT_A_QUESTION)
+        if _uds_ask_frame(data) and (not self.classic or self.bitrate != DIAGNOSTIC_BITRATE):
+            raise Fail(UDS_BUS_NOTE)
         self._ensure_lib()
         if fd or len(data) > 8:
             msg = MsgFD()
@@ -921,28 +1054,42 @@ def _cmd_send(argv):
         raise Fail("A question is sent once.")
     if _opt(argv, "--count") not in (None, "1"):
         raise Fail("A question is sent once.")
-    classic = _flag(argv, "--classic")
-    bitrate = int(_opt(argv, "--bitrate", "500000"))
+    uds = _flag(argv, "--uds")
+    classic = _flag(argv, "--classic") or uds
+    bitrate = int(_opt(argv, "--bitrate", str(DIAGNOSTIC_BITRATE)))
     frames = []
-    j1939_ask = _opt(argv, "--j1939")
-    if j1939_ask is not None:
-        if _opt(argv, "--id") or _opt(argv, "--list"):
-            raise Fail("send --j1939 asks for one parameter group only.")
-        frames.append(j1939_request_frame(j1939_ask))
-    if _opt(argv, "--list"):
-        frames.extend(_load_list(_opt(argv, "--list")))
-    if _opt(argv, "--id"):
-        ident = _opt(argv, "--id")
-        data = _parse_data(_opt(argv, "--data", ""))
-        ext = _flag(argv, "--extended") or len(ident) > 3
-        frames.append((int(ident, 16), data, ext))
+    if uds:
+        if _opt(argv, "--j1939") is not None or _opt(argv, "--list") or _opt(argv, "--id") or _opt(argv, "--data"):
+            raise Fail("send --uds is only the read-only UDS poll.")
+        if bitrate != DIAGNOSTIC_BITRATE:
+            raise Fail("Diagnostic CAN is classic %d bit/s (OBD pins 6 and 14)." % DIAGNOSTIC_BITRATE)
+        frames.extend(uds_read_frames(_opt(argv, "--session", "extended")))
+    else:
+        if _opt(argv, "--session") is not None:
+            raise Fail("--session is only valid with send --uds.")
+        j1939_ask = _opt(argv, "--j1939")
+        if j1939_ask is not None:
+            if _opt(argv, "--id") or _opt(argv, "--list"):
+                raise Fail("send --j1939 asks for one parameter group only.")
+            frames.append(j1939_request_frame(j1939_ask))
+        if _opt(argv, "--list"):
+            frames.extend(_load_list(_opt(argv, "--list")))
+        if _opt(argv, "--id"):
+            ident = _opt(argv, "--id")
+            data = _parse_data(_opt(argv, "--data", ""))
+            ext = _flag(argv, "--extended") or len(ident) > 3
+            frames.append((int(ident, 16), data, ext))
     if not frames:
         frames = standard_questions()
     for can_id, data, ext in frames:
         if not is_inquiry(can_id, data, ext):
             raise Fail(NOT_A_QUESTION)
+        if _uds_ask_frame(data) and (not classic or bitrate != DIAGNOSTIC_BITRATE):
+            raise Fail(UDS_BUS_NOTE)
     fd = False
     print(BUS_NOTE)
+    if any(_uds_ask_frame(data) for _can_id, data, _ext in frames):
+        print(UDS_BUS_NOTE)
     bus = PeakBus(lib_path=_opt(argv, "--lib", ""))
     bus.open_transmit(classic=classic, bitrate=bitrate)
     try:
@@ -956,13 +1103,18 @@ def _cmd_send(argv):
 
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
+        print("可以问，不能改")
         print("plot FILE.asc [--dbc FILE]")
         print("j1939 FILE.asc")
         print("decode FILE.asc [--dbc FILE]")
         print("dbc set FILE.dbc")
         print("send    ask the standard questions (speed, fault codes, VIN)")
+        print("send --uds    poll read-only UDS on diagnostic CAN (classic 500 kbit/s)")
+        print("send --id 7DF --data 02 10 03 --classic    extended session, a read")
         print("send --id 7DF --data 02 01 0D    one read request; writes are refused")
         print("send --j1939 dm1    ask one read-only J1939 group; DM3 and DM11 are refused")
+        print("Refused: programming session, flash ($34/$36/$37), write ($2E),")
+        print("IO control ($2F), routine control ($31), security access ($27).")
         print("Recording stays listen-only. CAN XL is not implemented.")
         return 0
     cmd, rest = argv[0], argv[1:]
