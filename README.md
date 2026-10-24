@@ -10,6 +10,10 @@ DBC that you supply.
 
 ## Design principles
 
+- **A full Diagnose page.** `connect --page diagnose.html` writes one page in the
+  active language: what to read, the adapter in plain language, the recommended
+  diagnostic bus, then the asks and the decoded replies. Choosing a read on
+  that page only highlights the row. It does not transmit.
 - **Plug in a dongle.** On open, Diagnose lists what is connected in plain language
   (vendor and product when known, otherwise “unknown USB-CAN, VID:PID …”).
   You do not choose Peak or ZLG. `connect` asks read-only UDS at classic 500 kbit/s
@@ -53,7 +57,7 @@ DBC that you supply.
 
 ```sh
 python3 canbench.py            # what is plugged in
-python3 canbench.py connect    # ask the vehicle, read-only
+python3 canbench.py connect --page diagnose.html
 WR_LANG=zh python3 canbench.py # same screen, simplified Chinese
 python3 canbench_test.py       # run the tests
 ```

@@ -521,6 +521,24 @@ class DecodeTests(unittest.TestCase):
         self.assertIn("You can ask. You cannot change.", page)
         self.assertNotIn("可以问，不能改", page)
         self.assertIn("do not need to know the brand", page)
+        self.assertIn("What do you want to diagnose?", page)
+        self.assertIn("Recommended bus", page)
+        self.assertIn("0x18DBFFF1", page)
+        self.assertIn("$27", page)
+        self.assertIn('type="button"', page)
+        self.assertNotIn("fetch(", page)
+        full = cb.connect_html(
+            [{"plain": "Peak PCAN-USB", "ready": True, "backend": "peak"}],
+            [cb.t("ask_only")],
+            asked=[(0x18DBFFF1, bytes.fromhex("0322F19000000000"), True)],
+            heard=[{"id": 0x18DAF110, "ext": True, "data": bytes.fromhex("0362F190000000")}],
+        )
+        self.assertIn("Peak PCAN-USB", full)
+        self.assertIn("03 22 F1 90", full)
+        self.assertIn("data value", full)
+        self.assertIn('data-goal="vin"', full)
+        self.assertIn("Asked, read only", full)
+        self.assertNotIn("可以问，不能改", full)
         real_enum = cb.enumerate_adapters
         cb.enumerate_adapters = lambda *args, **kwargs: []
         try:
@@ -551,8 +569,14 @@ class DecodeTests(unittest.TestCase):
             self.assertEqual(cb.t("ask_only"), "可以问，不能改")
             page = cb.connect_html([], [])
             self.assertIn("可以问，不能改", page)
+            self.assertIn("要诊断什么？", page)
             self.assertNotIn("You can ask", page)
+            self.assertNotIn("What do you want", page)
             self.assertIn('lang="zh-CN"', page)
+            for key in ("step_want", "step_bus", "page_lead", "status_asked"):
+                self.assertNotEqual(cb.COPY["zh"][key], cb.COPY["en"][key], key)
+                self.assertNotEqual(cb.COPY["de"][key], cb.COPY["en"][key], key)
+                self.assertNotEqual(cb.COPY["ja"][key], cb.COPY["en"][key], key)
             cb.set_lang("he")
             self.assertIn('dir="rtl"', cb.connect_html([], []))
         finally:

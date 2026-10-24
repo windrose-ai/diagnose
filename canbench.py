@@ -7,7 +7,7 @@
 # Recording stays listen-only. The ask path is a CAN adapter (Peak, ZLG, …):
 # PCAN-Basic, ZLG ControlCAN, or SocketCAN, classic ~500 kbit/s.
 # PCAN-USB FD does not speak CAN XL.
-# CANBENCH_REV = "2026-10-24.5"
+# CANBENCH_REV = "2026-10-24.6"
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import struct
 import sys
 import time
 
-CANBENCH_REV = "2026-10-24.5"
+CANBENCH_REV = "2026-10-24.6"
 ADAPTER_LABEL = "CAN adapter (Peak, ZLG, …)"
 CH1 = 0x51  # PCAN_USBBUS1
 LISTEN_ONLY = 0x08
@@ -1704,29 +1704,317 @@ def decode_public(frames):
     return "\n".join(lines) + ("\n" if lines else "")
 
 
-def connect_html(found, lines):
-    """The page shown when Diagnose opens. Brand is a name, not a choice the user must make."""
-    tag, direction = html_locale()
-    nothing = t("plain_nothing")
-    body = [
-        "<!DOCTYPE html><html lang=\"%s\" dir=\"%s\"><head><meta charset=\"utf-8\"><title>Windrose Diagnose</title>" % (html.escape(tag), direction),
-        "<style>body{background:#f6f5f2;color:#1c1c1c;font:15px -apple-system,sans-serif;margin:24px}",
-        "p.policy{font-weight:600}li{margin:6px 0}</style></head><body>",
-        "<h1>Windrose Diagnose</h1>",
-        "<p class=\"policy\">%s</p>" % html.escape(t("ask_only")),
-        "<p>%s</p>" % html.escape(t("plug_brand")),
-    ]
-    if not found and not any(nothing in (line or "") for line in lines):
-        body.append("<p>%s</p>" % html.escape(nothing))
+_DIAGNOSE_CSS = """
+:root{
+  --wr-page:#060f1e;--wr-card:#0d1f38;--wr-rail:#0a1a30;--wr-mast:#060f1e;--wr-mast-ink:#f0f4ff;
+  --wr-ink:#f0f4ff;--wr-ink-muted:#7a9abf;--wr-ink-faint:#5d7d9e;--wr-accent:#4a9eff;
+  --wr-accent-tint:rgba(74,158,255,.14);--wr-rule:rgba(74,158,255,.14);
+  --wr-rule-strong:rgba(74,158,255,.30);--wr-th:#102847;
+  --wr-warn:#3a2e19;--wr-warn-line:#e0a34a;--wr-warn-ink:#f3c98a;
+  --wr-note:#12263f;--wr-note-line:#4a9eff;--wr-note-ink:#c9dcf5;
+  --wr-ok:#143024;--wr-ok-line:#4ecfa0;--wr-ok-ink:#8fe3c4;
+  --wr-4:8px;--wr-5:12px;--wr-6:16px;--wr-7:24px;--wr-8:32px;
+  --wr-r-sm:4px;--wr-r:6px;--wr-r-lg:12px;--wr-r-pill:999px;
+  --wr-body:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue","PingFang SC","Hiragino Sans","Microsoft YaHei","Segoe UI",Roboto,"Noto Sans SC",Arial,sans-serif;
+  --wr-fs-sm:12px;--wr-fs-cap:13px;--wr-fs-body:15px;--wr-fs-lead:18px;--wr-fs-h1:38px;
+  --wr-maxw:1240px;
+}
+html{color-scheme:dark;background:var(--wr-page)}
+body.wr-page{margin:0;background:var(--wr-page);color:var(--wr-ink);font-family:var(--wr-body);font-size:var(--wr-fs-body);line-height:1.5}
+:lang(zh),:lang(ja),:lang(ko){letter-spacing:normal;text-transform:none}
+.wr-wrap{max-width:var(--wr-maxw);margin:0 auto;padding:var(--wr-7) var(--wr-6) 64px}
+.wr-mast{background:var(--wr-mast);color:var(--wr-mast-ink);border-bottom:1px solid var(--wr-rule)}
+.wr-mast .wr-wrap{padding-bottom:var(--wr-6)}
+.mast-row{display:flex;justify-content:space-between;align-items:flex-end;gap:var(--wr-6);flex-wrap:wrap}
+.wr-kicker{margin:0 0 6px;font-size:var(--wr-fs-sm);font-weight:600;color:var(--wr-ink-muted)}
+.wr-h1{margin:0;font-size:var(--wr-fs-h1);font-weight:600;line-height:1.15}
+.wr-chip{display:inline-block;padding:6px 12px;border-radius:var(--wr-r-pill);background:var(--wr-accent-tint);color:var(--wr-accent);font-size:var(--wr-fs-cap);font-weight:600}
+.wr-lead{font-size:var(--wr-fs-lead);color:var(--wr-ink-muted);margin:0 0 var(--wr-5);max-width:46rem}
+.wr-callout{border-left:3px solid;border-radius:var(--wr-r-sm);padding:var(--wr-4) var(--wr-5);margin:var(--wr-5) 0 var(--wr-6);font-size:var(--wr-fs-cap)}
+.wr-warn{background:var(--wr-warn);border-color:var(--wr-warn-line);color:var(--wr-warn-ink)}
+.wr-note{background:var(--wr-note);border-color:var(--wr-note-line);color:var(--wr-note-ink)}
+.wr-ok{background:var(--wr-ok);border-color:var(--wr-ok-line);color:var(--wr-ok-ink)}
+.wr-callout strong{display:block;font-size:var(--wr-fs-sm);font-weight:600;margin-bottom:2px}
+.wr-sec{background:var(--wr-card);border:1px solid var(--wr-rule);border-left:3px solid var(--wr-accent);border-radius:var(--wr-r-lg);margin:var(--wr-5) 0}
+.wr-sec>summary{cursor:pointer;list-style:none;padding:var(--wr-5) var(--wr-6);display:flex;gap:var(--wr-5);align-items:baseline;flex-wrap:wrap}
+.wr-sec>summary::-webkit-details-marker{display:none}
+.wr-sec>summary::before{content:"▸";color:var(--wr-accent);font-size:var(--wr-fs-sm);display:inline-block;transition:transform .15s ease}
+.wr-sec[open]>summary::before{transform:rotate(90deg)}
+[dir=rtl] .wr-sec>summary::before{content:"◂"}
+[dir=rtl] .wr-sec[open]>summary::before{transform:rotate(-90deg)}
+.wr-sec>summary:hover{background:var(--wr-rail)}
+.wr-sec>.wr-body{padding:var(--wr-5) var(--wr-6) var(--wr-6);border-top:1px solid var(--wr-rule)}
+.wr-sec-n{color:var(--wr-accent);font-weight:600;font-size:var(--wr-fs-cap)}
+.wr-sec-t{font-weight:600;font-size:var(--wr-fs-lead);color:var(--wr-ink)}
+.wr-sec-f{color:var(--wr-ink-muted);font-size:var(--wr-fs-cap)}
+.wr-muted{color:var(--wr-ink-muted)}
+.wr-goals{display:flex;flex-wrap:wrap;gap:var(--wr-4);margin-top:var(--wr-5)}
+.wr-btn{font-family:var(--wr-body);font-size:var(--wr-fs-cap);cursor:pointer;padding:8px 14px;border-radius:var(--wr-r-pill);border:1px solid var(--wr-rule-strong);background:transparent;color:var(--wr-ink)}
+.wr-btn[aria-pressed="true"]{background:var(--wr-accent);border-color:var(--wr-accent);color:#fff;font-weight:600}
+.wr-btn:focus-visible{outline:2px solid var(--wr-accent);outline-offset:2px}
+.wr-sub{font-size:var(--wr-fs-body);font-weight:600;margin:var(--wr-6) 0 var(--wr-4);color:var(--wr-ink)}
+.wr-fig-scroll{overflow-x:auto}
+.wr-table{border-collapse:collapse;width:100%;font-size:var(--wr-fs-cap)}
+.wr-table th{background:var(--wr-th);font-weight:600;font-size:var(--wr-fs-sm);color:var(--wr-ink-muted)}
+.wr-table th,.wr-table td{border:1px solid var(--wr-rule-strong);padding:6px 8px;text-align:start;vertical-align:top}
+.wr-table td.wr-n{font-variant-numeric:tabular-nums;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.wr-table tr.is-hot td{background:rgba(74,158,255,.16)}
+.wr-foot{color:var(--wr-ink-faint);font-size:var(--wr-fs-cap);margin-top:var(--wr-8)}
+@media(max-width:640px){
+  :root{--wr-fs-h1:28px}
+  .wr-wrap{padding:var(--wr-6) var(--wr-5) 48px}
+}
+"""
+
+_DIAGNOSE_JS = """
+(function () {
+  var buttons = document.querySelectorAll("button.wr-btn[data-goal]");
+  function paint() {
+    var on = {}, any = false;
+    buttons.forEach(function (b) {
+      if (b.getAttribute("aria-pressed") === "true") { on[b.getAttribute("data-goal")] = true; any = true; }
+    });
+    document.querySelectorAll("tr[data-goal]").forEach(function (row) {
+      var goal = row.getAttribute("data-goal");
+      var show = !any || !goal || !!on[goal];
+      row.hidden = !show;
+      if (any && goal && on[goal]) row.classList.add("is-hot");
+      else row.classList.remove("is-hot");
+    });
+    var box = document.getElementById("results");
+    if (box && any) box.open = true;
+  }
+  buttons.forEach(function (b) {
+    b.addEventListener("click", function () {
+      var was = b.getAttribute("aria-pressed") === "true";
+      buttons.forEach(function (other) { other.setAttribute("aria-pressed", "false"); });
+      b.setAttribute("aria-pressed", was ? "false" : "true");
+      paint();
+    });
+  });
+})();
+"""
+
+_GOAL_KEY = {
+    "session": "goal_session",
+    "present": "goal_present",
+    "vin": "goal_vin",
+    "faults": "goal_faults",
+}
+
+
+def _esc(value):
+    return html.escape("" if value is None else str(value), quote=True)
+
+
+def _frame_parts(frame):
+    """(id, data) from a send tuple or a listen dict."""
+    if isinstance(frame, dict):
+        can_id = int(frame.get("id") or 0)
+        data = frame.get("data") or b""
+    else:
+        can_id = int(frame[0])
+        data = frame[1]
+    if isinstance(data, str):
+        data = data.encode("latin1")
+    else:
+        data = bytes(bytearray(data))
+    return can_id & 0x1FFFFFFF, data
+
+
+def _goal_of(data):
+    if not data:
+        return ""
+    sid = data[0]
+    if len(data) >= 2 and 1 <= data[0] <= 7:
+        sid = data[1]
+    if sid == 0x7F and len(data) >= 3:
+        sid = data[2] if 1 <= data[0] <= 7 else data[1]
+    return {
+        0x10: "session", 0x50: "session",
+        0x3E: "present", 0x7E: "present",
+        0x22: "vin", 0x62: "vin",
+        0x19: "faults", 0x59: "faults",
+    }.get(sid, "")
+
+
+def _ask_hex(data):
+    if data and 1 <= (data[0] & 0x0F) <= 7:
+        count = 1 + (data[0] & 0x0F)
+    else:
+        count = len(data)
+    return " ".join("%02X" % (byte & 0xFF) for byte in data[:count])
+
+
+def _after_label(line):
+    for sep in (": ", "："):
+        if sep in line:
+            return line.split(sep, 1)[1].strip().rstrip("。.")
+    return line.strip().rstrip("。.")
+
+
+def _clip(text, limit=96):
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _asked_rows(frames):
+    rows = []
+    for frame in frames or []:
+        can_id, data = _frame_parts(frame)
+        goal = _goal_of(data)
+        what = t(_GOAL_KEY[goal]) if goal in _GOAL_KEY else t("col_ask")
+        rows.append((goal, what, "0x%X" % can_id, _ask_hex(data)))
+    return rows
+
+
+def _heard_rows(frames):
+    rows = []
+    for frame in frames or []:
+        can_id, data = _frame_parts(frame)
+        raw = decode_public([{"id": can_id, "data": data, "ext": can_id > 0x7FF}]).strip()
+        if not raw:
+            continue
+        if _is_uds_response(can_id):
+            label = _after_label(raw.splitlines()[0])
+        else:
+            label = " ".join(raw.split())
+        rows.append((_goal_of(data), "0x%X" % can_id, label))
+    return rows
+
+
+def _page_status(found, lines, asked):
+    blob = "\n".join(line or "" for line in (lines or []))
+    for key in ("plain_boundary", "plain_driver", "plain_bitrate", "plain_power"):
+        sentence = t(key)
+        if sentence and sentence in blob:
+            return "warn", sentence
+    if asked:
+        return "ok", t("status_asked")
+    ready = [dev for dev in (found or []) if dev.get("ready")]
+    if ready:
+        prefix = t("found").split("%s")[0]
+        for line in reversed(lines or []):
+            text = line or ""
+            if text and text != t("ask_only") and prefix not in text:
+                return "warn", text
+        return "ok", t("status_ready")
     if found:
-        body.append("<ul>")
-        for dev in found:
-            body.append("<li>%s</li>" % html.escape(dev.get("plain") or "unknown USB-CAN"))
-        body.append("</ul>")
-    for line in lines:
-        body.append("<p>%s</p>" % html.escape(line))
-    body.append("</body></html>")
-    return "".join(body)
+        return "warn", t("status_driver")
+    return "note", t("plain_nothing")
+
+
+def _dev_plain(dev):
+    return (dev or {}).get("plain") or "unknown USB-CAN"
+
+
+def _section(num, title, finding, inner, ident=""):
+    open_id = (' id="%s"' % ident) if ident else ""
+    head = (
+        '<details class="wr-sec" open%s><summary>'
+        '<span class="wr-sec-n">%s</span>'
+        '<span class="wr-sec-t">%s</span>'
+        '<span class="wr-sec-f">%s</span></summary><div class="wr-body">'
+    ) % (open_id, _esc(num), _esc(title), _esc(finding))
+    return head + inner + "</div></details>"
+
+
+def _goal_buttons():
+    buttons = []
+    for goal in ("session", "present", "vin", "faults"):
+        buttons.append(
+            '<button type="button" class="wr-btn" data-goal="%s" aria-pressed="false">%s</button>'
+            % (goal, _esc(t(_GOAL_KEY[goal])))
+        )
+    return '<div class="wr-goals">%s</div>' % "".join(buttons)
+
+
+def _rows_table(headers, rows, mono=()):
+    head = "".join("<th>%s</th>" % _esc(cell) for cell in headers)
+    body = []
+    for row in rows:
+        goal = row[0]
+        cells = []
+        for i, cell in enumerate(row[1:]):
+            cls = ' class="wr-n"' if i in mono else ""
+            cells.append("<td%s>%s</td>" % (cls, _esc(cell)))
+        body.append('<tr data-goal="%s">%s</tr>' % (goal, "".join(cells)))
+    return (
+        '<div class="wr-fig-scroll"><table class="wr-table"><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
+        % (head, "".join(body))
+    )
+
+
+def connect_html(found, lines, asked=None, heard=None):
+    """Full Diagnose page. A goal button only highlights a row. It does not transmit."""
+    tag, direction = html_locale()
+    kind, sentence = _page_status(found, lines, asked)
+    asked_rows = _asked_rows(asked)
+    heard_rows = _heard_rows(heard)
+    want = "<p>%s</p>%s" % (_esc(t("step_want_body")), _goal_buttons())
+    want_find = " · ".join(t(key) for key in ("goal_session", "goal_vin", "goal_faults"))
+    adapter = ["<p>%s</p>" % _esc(t("plug_brand")), "<p>%s</p>" % _esc(t("step_adapter_body"))]
+    if found:
+        adapter.append(_rows_table(
+            (t("col_name"), t("col_state")),
+            [("", _dev_plain(dev), t("status_ready") if dev.get("ready") else t("status_driver")) for dev in found],
+        ))
+        adapter_find = ", ".join(_dev_plain(dev) for dev in found)
+    else:
+        adapter.append("<p>%s</p>" % _esc(t("plain_nothing")))
+        adapter_find = t("status_none")
+    bus = "<p>%s</p>%s" % (
+        _esc(t("step_bus_body")),
+        _rows_table(
+            (t("col_what"), t("col_result")),
+            [
+                ("", t("bus_where"), t("bus_where_val")),
+                ("", t("bus_kind"), t("bus_kind_val")),
+                ("", t("bus_ask"), t("bus_ask_val")),
+                ("", t("bus_never"), t("bus_never_val")),
+            ],
+        ),
+    )
+    results = ["<p>%s</p>" % _esc(t("step_results_body")), "<h2 class=\"wr-sub\">%s</h2>" % _esc(t("results_asked"))]
+    if asked_rows:
+        results.append(_rows_table((t("col_what"), t("col_id"), t("col_ask")), asked_rows, mono=(1, 2)))
+    else:
+        results.append('<p class="wr-muted">%s</p>' % _esc(t("result_waiting")))
+    results.append("<h2 class=\"wr-sub\">%s</h2>" % _esc(t("results_heard")))
+    if heard_rows:
+        results.append(_rows_table((t("col_id"), t("col_result")), [
+            (goal, ident, label) for goal, ident, label in heard_rows
+        ], mono=(0,)))
+        result_find = _clip(" · ".join(label for _goal, _ident, label in heard_rows[:3]))
+    else:
+        results.append('<p class="wr-muted">%s</p>' % _esc(t("result_none")))
+        result_find = t("result_none") if asked_rows else t("result_waiting")
+    parts = [
+        '<!DOCTYPE html><html lang="%s" dir="%s"><head><meta charset="utf-8">' % (_esc(tag), direction),
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        "<title>%s</title><style>" % _esc(t("page_kicker") + " " + t("page_title")),
+        _DIAGNOSE_CSS,
+        '</style></head><body class="wr-page">',
+        '<header class="wr-mast"><div class="wr-wrap mast-row"><div>',
+        '<p class="wr-kicker">%s</p>' % _esc(t("page_kicker")),
+        '<h1 class="wr-h1">%s</h1></div>' % _esc(t("page_title")),
+        '<p class="wr-chip">%s</p></div></header>' % _esc(t("ask_only")),
+        '<main class="wr-wrap">',
+        '<p class="wr-lead">%s</p>' % _esc(t("page_lead")),
+        '<div class="wr-callout wr-%s" role="status"><strong>%s</strong>%s</div>' % (
+            kind, _esc(t("status_label")), _esc(sentence),
+        ),
+        _section("1", t("step_want"), want_find, want, "want"),
+        _section("2", t("step_adapter"), _clip(adapter_find), "".join(adapter), "adapter"),
+        _section("3", t("step_bus"), t("bus_kind_val"), bus, "bus"),
+        _section("4", t("step_results"), result_find, "".join(results), "results"),
+        '<p class="wr-foot">%s</p></main><script>' % _esc(t("page_foot")),
+        _DIAGNOSE_JS,
+        "</script></body></html>",
+    ]
+    return "".join(parts)
 
 
 def run_connect(found=None, open_port=None, libs=None):
@@ -1949,7 +2237,9 @@ def _cmd_connect(argv):
     page = _opt(argv, "--page")
     if page:
         with open(page, "w", encoding="utf-8") as handle:
-            handle.write(connect_html(report["found"], report["lines"]))
+            handle.write(connect_html(
+                report["found"], report["lines"], report.get("asked"), report.get("heard"),
+            ))
         print(page)
     if report["ok"] or not any(dev.get("ready") for dev in report["found"]):
         return 0

@@ -46,8 +46,12 @@ assert.strictEqual(cb.normLang("zh-CN"), "zh");
 assert.strictEqual(cb.normLang("en_uk"), "en");
 var zhPage = cb.connectPage([], [], "zh");
 assert.ok(zhPage.indexOf("可以问，不能改") >= 0);
+assert.ok(zhPage.indexOf("要诊断什么？") >= 0);
 assert.strictEqual(zhPage.indexOf("You can ask"), -1);
+assert.strictEqual(zhPage.indexOf("What do you want"), -1);
 assert.ok(zhPage.indexOf('lang="zh-CN"') >= 0);
+assert.ok(zhPage.indexOf("0x18DBFFF1") >= 0);
+assert.ok(zhPage.indexOf('type="button"') >= 0);
 assert.ok(cb.connectPage([], [], "ar").indexOf('dir="rtl"') >= 0);
 assert.strictEqual(cb.adapterLabel, "CAN adapter (Peak, ZLG, …)");
 assert.ok(page.indexOf(cb.adapterLabel) >= 0);
@@ -92,6 +96,21 @@ assert.ok(opened.indexOf("You can ask. You cannot change.") >= 0);
 assert.strictEqual(opened.indexOf("可以问，不能改"), -1);
 assert.ok(opened.indexOf("do not need to know the brand") >= 0);
 assert.strictEqual(cb.connectPage([], []).indexOf("Nothing is plugged in") >= 0, true);
+var full = cb.connectPage(
+  [{ plain: "Peak PCAN-USB", ready: true }],
+  ["You can ask. You cannot change."],
+  "en",
+  [{ id: 0x18DBFFF1, ext: true, data: [0x03, 0x22, 0xF1, 0x90, 0, 0, 0, 0] }],
+  [{ id: 0x18DAF110, ext: true, data: [0x03, 0x62, 0xF1, 0x90, 0, 0, 0, 0] }]
+);
+assert.ok(full.indexOf("What do you want to diagnose?") >= 0);
+assert.ok(full.indexOf("0x18DBFFF1") >= 0);
+assert.ok(full.indexOf("03 22 F1 90") >= 0);
+assert.ok(full.indexOf("data value") >= 0);
+assert.ok(full.indexOf("wr-sec") >= 0);
+assert.ok(full.indexOf('type="button"') >= 0);
+assert.strictEqual(full.indexOf("fetch("), -1);
+assert.strictEqual(full.indexOf("可以问，不能改"), -1);
 assert.strictEqual(cb.isInquiry(0x7E0, [0x30, 0x00, 0x00], false), true);
 assert.strictEqual(cb.isInquiry(0x18FEF100, [0, 1, 2, 3, 4, 5, 6, 7], true), false);
 var req = cb.j1939Request("dm1");
