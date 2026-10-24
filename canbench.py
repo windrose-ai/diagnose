@@ -1685,9 +1685,9 @@ def connect_html(found, lines):
         "<p class=\"policy\">可以问，不能改</p>",
         "<p>Plug in a USB-CAN dongle. You do not need to know the brand.</p>",
     ]
-    if not found:
+    if not found and not any(PLAIN_NOTHING in (line or "") for line in lines):
         body.append("<p>%s</p>" % html.escape(PLAIN_NOTHING))
-    else:
+    if found:
         body.append("<ul>")
         for dev in found:
             body.append("<li>%s</li>" % html.escape(dev.get("plain") or "unknown USB-CAN"))
