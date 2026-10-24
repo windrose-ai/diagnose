@@ -18,6 +18,7 @@
   var READ_PGN = {65226:1, 65227:1, 65229:1, 65230:1, 65231:1, 65236:1, 65260:1, 65259:1, 65242:1, 60928:1};
   var READ_NAME = {dm1:65226, dm2:65227, dm4:65229, dm5:65230, dm6:65231, dm12:65236, vin:65260, component:65259, software:65242, address:60928};
 
+  var WH13_FUNCTIONAL = 0x18dbfff1;
   var UDS_ASK = {0x10:1, 0x19:1, 0x22:1, 0x3E:1};
   var OBD_READ = {0x01:1, 0x02:1, 0x03:1, 0x05:1, 0x06:1, 0x07:1, 0x09:1, 0x0A:1};
   var BLOCKED = {
@@ -43,10 +44,29 @@
     if (sid === 0x19) return payload.length >= 2 && (payload[1] & 0x7f) !== 0;
     return !!OBD_READ[sid];
   }
-  function udsReadFrames(session) {
+  function isWh13Request(canId, extended) {
+    var id = canId >>> 0;
+    var ext = !!extended || id > 0x7ff;
+    if (!ext) return false;
+    if (id === WH13_FUNCTIONAL) return true;
+    return (id & 0xffff00ff) === 0x18da00f1 && ((id >>> 8) & 0xff) !== 0xf1;
+  }
+  function isJ1979Request(canId, extended) {
+    var id = canId >>> 0;
+    var ext = !!extended || id > 0x7ff;
+    if (!ext) return id === 0x7df || (id >= 0x7e0 && id <= 0x7e7);
+    return id === 0x18db33f1;
+  }
+  function udsReadFrames(session, target) {
     var which = session || "extended";
     var sub = which === "default" ? 0x01 : 0x03;
     if (which !== "default" && which !== "extended") return null;
+    var id = WH13_FUNCTIONAL;
+    if (target != null) {
+      var n = target & 255;
+      if ((target !== n) || n === 0xf1) return null;
+      id = (0x18da00f1 | (n << 8)) >>> 0;
+    }
     var bodies = [
       [0x02, 0x10, sub],
       [0x02, 0x3e, 0x00],
@@ -56,7 +76,7 @@
     return bodies.map(function (body) {
       var data = body.slice();
       while (data.length < 8) data.push(0);
-      return { id: 0x7df, data: data, ext: false };
+      return { id: id, data: data, ext: true };
     });
   }
   function isJ1939ReadRequest(canId, data, extended) {
@@ -74,19 +94,20 @@
   function isInquiry(canId, data, extended) {
     var b = data || [];
     if (isJ1939ReadRequest(canId, b, extended)) return true;
-    var id = canId >>> 0;
-    var ext = !!extended || id > 0x7ff;
-    var ok = !ext ? (id === 0x7df || (id >= 0x7e0 && id <= 0x7e7))
-      : (id === 0x18db33f1 || (((id & 0xffff00ff) === 0x18da00f1) && (((id >>> 8) & 0xff) !== 0xf1)));
-    if (!ok || b.length < 2) return false;
+    if (b.length < 2) return false;
     var pci = b[0] & 255;
+    var onDiag = isWh13Request(canId, extended) || isJ1979Request(canId, extended);
     if (pci === 0x30) {
+      if (!onDiag) return false;
       if (b.length < 3 || (b[1] & 255) !== 0 || (b[2] & 255) !== 0) return false;
       for (var i = 3; i < b.length; i++) if ((b[i] & 255) !== 0) return false;
       return true;
     }
     if (pci < 1 || pci > 7 || b.length < 1 + pci) return false;
-    return serviceIsRead(b.slice(1, 1 + pci));
+    var payload = b.slice(1, 1 + pci);
+    if (!serviceIsRead(payload)) return false;
+    if (UDS_ASK[payload[0] & 255]) return isWh13Request(canId, extended);
+    return isJ1979Request(canId, extended);
   }
   function j1939Request(name) {
     var key = String(name).toLowerCase();

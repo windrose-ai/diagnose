@@ -70,7 +70,12 @@ FD_TP_DT = 0x4E00
 # Diagnostic interface only: OBD pins 6 and 14, classic CAN, via TGW / GWCANFD9.
 # Not the powertrain backbone.
 DIAGNOSTIC_BITRATE = 500000
-DIAGNOSTIC_ID = 0x7DF
+# WH13 / E700 UDS is 29-bit. Functional broadcast, tester source 0xF1.
+# Physical request is 0x18DAxxF1. Response 0x18DAF1xx is never transmitted.
+WH13_FUNCTIONAL = 0x18DBFFF1
+# J1979 legacy only. UDS asks are not sent on these ids.
+J1979_FUNCTIONAL = 0x7DF
+J1979_FUNCTIONAL_EXT = 0x18DB33F1
 ASK_ONLY = "可以问，不能改"
 BUS_NOTE = (
     "可以问，不能改。Asking only. Nothing on the truck is changed. "
@@ -78,14 +83,15 @@ BUS_NOTE = (
 )
 UDS_BUS_NOTE = (
     "UDS asks go out on the diagnostic CAN only "
-    "(OBD pins 6/14, classic 500 kbit/s via TGW / GWCANFD9)."
+    "(OBD pins 6/14, classic 500 kbit/s via TGW / GWCANFD9, "
+    "29-bit functional 0x18DBFFF1 or physical 0x18DAxxF1)."
 )
 # Transmit allowlist. A service id that is not listed is refused.
 # Keep these sets in sync with canbench.js.
 # $10 is listed, and only default (0x01) and extended (0x03) sub-functions pass.
 # Programming session (0x02) is the flash entry and is refused below.
 UDS_ASK_SERVICES = frozenset((0x10, 0x19, 0x22, 0x3E))
-# J1979 reads already supported. Mode 01 and 09 are the WH13 pair.
+# J1979 reads already supported, on 0x7DF / 0x7E0-0x7E7 / 0x18DB33F1 only.
 # Mode 04 (clear) and mode 08 (control) are not in this set.
 OBD_READ_SERVICES = frozenset((0x01, 0x02, 0x03, 0x05, 0x06, 0x07, 0x09, 0x0A))
 # Hard block. Checked before the allowlist. No seed-key, flash, write, or control.
@@ -142,15 +148,35 @@ def is_j1939_read_request(can_id, data, extended=False):
     return all(b in (0xFF, 0x00) for b in data[3:])
 
 
+def _id_ext(can_id, extended=False):
+    n = can_id & 0x1FFFFFFF
+    return n, bool(extended or n > 0x7FF)
+
+
+def is_wh13_request(can_id, extended=False):
+    """WH13 / E700 tester request. Functional 0x18DBFFF1 or physical 0x18DAxxF1.
+
+    Response ids 0x18DAF1xx are not requests and are never transmitted.
+    """
+    n, extended = _id_ext(can_id, extended)
+    if not extended:
+        return False
+    if n == WH13_FUNCTIONAL:
+        return True
+    return (n & 0xFFFF00FF) == 0x18DA00F1 and ((n >> 8) & 0xFF) != 0xF1
+
+
+def is_j1979_request(can_id, extended=False):
+    """Passenger-car / legislated OBD request ids. Not the WH13 UDS address."""
+    n, extended = _id_ext(can_id, extended)
+    if not extended:
+        return n == J1979_FUNCTIONAL or 0x7E0 <= n <= 0x7E7
+    return n == J1979_FUNCTIONAL_EXT
+
+
 def is_diagnostic_address(can_id, extended=False):
     """Tester request ids on the diagnostic interface. Not a powertrain backbone id."""
-    n = can_id & 0x1FFFFFFF
-    extended = extended or n > 0x7FF
-    if not extended:
-        return n == DIAGNOSTIC_ID or 0x7E0 <= n <= 0x7E7
-    return n == 0x18DB33F1 or (
-        (n & 0xFFFF00FF) == 0x18DA00F1 and ((n >> 8) & 0xFF) != 0xF1
-    )
+    return is_wh13_request(can_id, extended) or is_j1979_request(can_id, extended)
 
 
 def service_is_read(payload):
@@ -184,18 +210,29 @@ def service_is_read(payload):
 
 
 def is_inquiry(can_id, data, extended=False):
-    """True for a diagnostic question or the flow-control that finishes a read."""
+    """True for a diagnostic question or the flow-control that finishes a read.
+
+    UDS asks ($10, $19, $22, $3E) are WH13 29-bit only. J1979 reads stay on
+    0x7DF, 0x7E0-0x7E7, and 0x18DB33F1.
+    """
     data = bytes(data)
     if is_j1939_read_request(can_id, data, extended):
         return True
-    if not is_diagnostic_address(can_id, extended) or len(data) < 2:
+    if len(data) < 2:
         return False
     pci = data[0]
     if pci == 0x30:
+        if not is_diagnostic_address(can_id, extended):
+            return False
         return len(data) >= 3 and data[1] == 0x00 and data[2] == 0x00 and not any(data[3:])
     if pci < 1 or pci > 7 or len(data) < 1 + pci:
         return False
-    return service_is_read(data[1:1 + pci])
+    payload = data[1:1 + pci]
+    if not service_is_read(payload):
+        return False
+    if payload[0] in UDS_ASK_SERVICES:
+        return is_wh13_request(can_id, extended)
+    return is_j1979_request(can_id, extended)
 
 
 def j1939_request_pgn(name):
@@ -243,15 +280,40 @@ def standard_questions():
     frames = []
     for body in bodies:
         pad = _pad8(body)
-        frames.append((DIAGNOSTIC_ID, pad, False))
-        frames.append((0x18DB33F1, pad, True))
+        frames.append((J1979_FUNCTIONAL, pad, False))
+        frames.append((J1979_FUNCTIONAL_EXT, pad, True))
     return frames
 
 
-def uds_read_frames(session="extended"):
-    """One read-only UDS poll on the diagnostic functional id.
+def wh13_request_id(target=None):
+    """Functional 0x18DBFFF1, or physical 0x18DAxxF1 when target is an ECU byte."""
+    if target is None:
+        return WH13_FUNCTIONAL
+    if isinstance(target, str):
+        target = _parse_target(target)
+    if not isinstance(target, int) or isinstance(target, bool) or not 0 <= target <= 0xFF or target == 0xF1:
+        raise Fail("UDS physical target is one byte other than the tester address 0xF1.")
+    return 0x18DA00F1 | (target << 8)
 
-    Order: session (default or extended), TesterPresent, VIN by identifier,
+
+def _parse_target(text):
+    text = str(text).strip().lower()
+    if text.startswith("0x"):
+        text = text[2:]
+    try:
+        target = int(text, 16)
+    except ValueError:
+        raise Fail("UDS --target is one hex byte, for physical id 0x18DAxxF1.")
+    if not 0 <= target <= 0xFF or target == 0xF1:
+        raise Fail("UDS --target is one byte other than the tester address 0xF1.")
+    return target
+
+
+def uds_read_frames(session="extended", target=None):
+    """One read-only UDS poll on the WH13 29-bit diagnostic id.
+
+    Default id is functional 0x18DBFFF1. Pass target to use physical
+    0x18DAxxF1. Order: session (default or extended), TesterPresent, VIN,
     then stored DTCs. No programming session, no write, no security access.
     """
     if session == "default":
@@ -260,6 +322,7 @@ def uds_read_frames(session="extended"):
         sub = 0x03
     else:
         raise Fail("UDS session must be default or extended. Programming is not a read.")
+    can_id = wh13_request_id(target)
     bodies = [
         bytes((0x02, 0x10, sub)),
         bytes((0x02, 0x3E, 0x00)),
@@ -268,7 +331,7 @@ def uds_read_frames(session="extended"):
     ]
     frames = []
     for body in bodies:
-        frame = (DIAGNOSTIC_ID, _pad8(body), False)
+        frame = (can_id, _pad8(body), True)
         if not is_inquiry(frame[0], frame[1], frame[2]):
             raise Fail(NOT_A_QUESTION)
         frames.append(frame)
@@ -1063,10 +1126,11 @@ def _cmd_send(argv):
             raise Fail("send --uds is only the read-only UDS poll.")
         if bitrate != DIAGNOSTIC_BITRATE:
             raise Fail("Diagnostic CAN is classic %d bit/s (OBD pins 6 and 14)." % DIAGNOSTIC_BITRATE)
-        frames.extend(uds_read_frames(_opt(argv, "--session", "extended")))
+        target = _parse_target(_opt(argv, "--target")) if _opt(argv, "--target") is not None else None
+        frames.extend(uds_read_frames(_opt(argv, "--session", "extended"), target))
     else:
-        if _opt(argv, "--session") is not None:
-            raise Fail("--session is only valid with send --uds.")
+        if _opt(argv, "--session") is not None or _opt(argv, "--target") is not None:
+            raise Fail("--session and --target are only valid with send --uds.")
         j1939_ask = _opt(argv, "--j1939")
         if j1939_ask is not None:
             if _opt(argv, "--id") or _opt(argv, "--list"):
@@ -1108,10 +1172,11 @@ def main(argv):
         print("j1939 FILE.asc")
         print("decode FILE.asc [--dbc FILE]")
         print("dbc set FILE.dbc")
-        print("send    ask the standard questions (speed, fault codes, VIN)")
-        print("send --uds    poll read-only UDS on diagnostic CAN (classic 500 kbit/s)")
-        print("send --id 7DF --data 02 10 03 --classic    extended session, a read")
-        print("send --id 7DF --data 02 01 0D    one read request; writes are refused")
+        print("send    ask the standard J1979 questions (speed, fault codes, VIN)")
+        print("send --uds    WH13 UDS poll on 29-bit 0x18DBFFF1 (classic 500 kbit/s)")
+        print("send --uds --target 10    same poll, physical 0x18DA10F1")
+        print("send --id 18DBFFF1 --data 02 10 03 --classic    extended session, a read")
+        print("send --id 7DF --data 02 01 0D    J1979 legacy read; UDS is not sent on 7DF")
         print("send --j1939 dm1    ask one read-only J1939 group; DM3 and DM11 are refused")
         print("Refused: programming session, flash ($34/$36/$37), write ($2E),")
         print("IO control ($2F), routine control ($31), security access ($27).")

@@ -88,7 +88,10 @@ class DecodeTests(unittest.TestCase):
         self.assertTrue(cb.is_inquiry(0x7DF, bytes.fromhex("02010D"), False))
         self.assertTrue(cb.is_inquiry(0x18DB33F1, bytes.fromhex("020902"), True))
         self.assertTrue(cb.is_inquiry(0x7E0, bytes.fromhex("300000"), False))
-        self.assertTrue(cb.is_inquiry(0x7E0, bytes.fromhex("0322F190"), False))
+        self.assertTrue(cb.is_inquiry(0x18DBFFF1, bytes.fromhex("0322F190"), True))
+        self.assertFalse(cb.is_inquiry(0x7E0, bytes.fromhex("0322F190"), False))
+        legacy = {can_id for can_id, _data, _ext in cb.standard_questions()}
+        self.assertEqual(legacy, {0x7DF, 0x18DB33F1})
         self.assertFalse(cb.is_inquiry(0x7DF, bytes.fromhex("032EF190"), False))
         self.assertFalse(cb.is_inquiry(0x7DF, bytes.fromhex("0104"), False))
         self.assertFalse(cb.is_inquiry(0x7DF, bytes.fromhex("023101"), False))
@@ -218,16 +221,24 @@ class DecodeTests(unittest.TestCase):
             body = bytes.fromhex(hex_bytes)
             return body + bytes(8 - len(body))
 
-        allowed = (
+        uds_ok = (
             "021001", "021003", "021081", "021083",
             "023E00", "023E80", "0322F190", "031902FF",
-            "02010D", "020902", "0103",
         )
-        for raw in allowed:
-            self.assertTrue(cb.is_inquiry(0x7DF, frame(raw), False), raw)
+        for raw in uds_ok:
+            self.assertTrue(cb.is_inquiry(0x18DBFFF1, frame(raw), True), raw)
+            self.assertTrue(cb.is_inquiry(0x18DA10F1, frame(raw), True), raw)
+            self.assertFalse(cb.is_inquiry(0x7DF, frame(raw), False), raw)
+            self.assertFalse(cb.is_inquiry(0x18DAF110, frame(raw), True), raw)
             self.assertTrue(cb.service_is_read(bytes.fromhex(raw)[1:]), raw)
-        self.assertTrue(cb.is_inquiry(0x7E0, frame("0322F191"), False))
-        self.assertTrue(cb.is_inquiry(0x18DB33F1, frame("031902FF"), True))
+        for raw in ("02010D", "020902", "0103"):
+            self.assertTrue(cb.is_inquiry(0x7DF, frame(raw), False), raw)
+            self.assertFalse(cb.is_inquiry(0x18DBFFF1, frame(raw), True), raw)
+            self.assertTrue(cb.service_is_read(bytes.fromhex(raw)[1:]), raw)
+        self.assertTrue(cb.is_inquiry(0x18DB33F1, frame("020902"), True))
+        self.assertFalse(cb.is_inquiry(0x18DB33F1, frame("0322F190"), True))
+        self.assertTrue(cb.is_inquiry(0x18DA10F1, bytes.fromhex("3000000000000000"), True))
+        self.assertFalse(cb.is_inquiry(0x18DAF110, bytes.fromhex("3000000000000000"), True))
         blocked = (
             "021002", "021082", "021004", "03100300",
             "022701", "042702AABB", "023E01", "0222F1",
@@ -238,21 +249,30 @@ class DecodeTests(unittest.TestCase):
             "03280101", "023D00",
         )
         for raw in blocked:
+            self.assertFalse(cb.is_inquiry(0x18DBFFF1, frame(raw), True), raw)
             self.assertFalse(cb.is_inquiry(0x7DF, frame(raw), False), raw)
         self.assertFalse(cb.is_inquiry(0x0CF00400, frame("0322F190"), True))
         self.assertFalse(cb.is_inquiry(0x18DA10F1, frame("021002"), True))
         passed = []
+        wh13 = []
         for sid in range(256):
             probe = bytes((0x02, sid, 0x00)) + bytes(5)
             if cb.is_inquiry(0x7DF, probe, False):
                 passed.append(sid)
-        self.assertEqual(set(passed), set(cb.OBD_READ_SERVICES) | {0x3E})
+            if cb.is_inquiry(0x18DBFFF1, probe, True):
+                wh13.append(sid)
+        self.assertEqual(set(passed), set(cb.OBD_READ_SERVICES))
+        self.assertEqual(set(wh13), {0x3E})
         self.assertTrue(cb.BLOCKED_SERVICES.isdisjoint(cb.UDS_ASK_SERVICES))
         self.assertTrue(cb.BLOCKED_SERVICES.isdisjoint(cb.OBD_READ_SERVICES))
         poll = cb.uds_read_frames("extended")
-        self.assertEqual([item[0] for item in poll], [0x7DF] * 4)
+        self.assertEqual([item[0] for item in poll], [0x18DBFFF1] * 4)
+        self.assertEqual([item[2] for item in poll], [True] * 4)
         for can_id, data, ext in poll:
             self.assertTrue(cb.is_inquiry(can_id, data, ext))
+        physical = cb.uds_read_frames("extended", 0x10)
+        self.assertEqual([item[0] for item in physical], [0x18DA10F1] * 4)
+        self.assertEqual(cb.wh13_request_id("10"), 0x18DA10F1)
         self.assertEqual(bytes(poll[0][1][:3]), bytes.fromhex("021003"))
         self.assertEqual(bytes(poll[1][1][:3]), bytes.fromhex("023E00"))
         self.assertEqual(bytes(poll[2][1][:4]), bytes.fromhex("0322F190"))
@@ -265,15 +285,17 @@ class DecodeTests(unittest.TestCase):
         bare.classic = False
         bare.bitrate = cb.DIAGNOSTIC_BITRATE
         with self.assertRaises(cb.Fail) as caught:
-            bare.send(0x7DF, bytes.fromhex("021003"), extended=False)
-        self.assertIn("diagnostic CAN", str(caught.exception))
+            bare.send(0x18DBFFF1, bytes.fromhex("021003"), extended=True)
+        self.assertIn("0x18DBFFF1", str(caught.exception))
         bare.classic = True
         bare.bitrate = 250000
         with self.assertRaises(cb.Fail):
-            bare.send(0x7DF, bytes.fromhex("021003"), extended=False)
+            bare.send(0x18DBFFF1, bytes.fromhex("021003"), extended=True)
         bare.bitrate = cb.DIAGNOSTIC_BITRATE
         with self.assertRaises(cb.Fail):
-            bare.send(0x7DF, bytes.fromhex("022701"), extended=False)
+            bare.send(0x18DBFFF1, bytes.fromhex("022701"), extended=True)
+        with self.assertRaises(cb.Fail):
+            bare.send(0x7DF, bytes.fromhex("021003"), extended=False)
         with self.assertRaises(cb.Fail):
             bare.send(0x0CF00400, bytes.fromhex("0322F190"), extended=True)
         opened = []
@@ -287,7 +309,7 @@ class DecodeTests(unittest.TestCase):
         def fake_send(self, can_id, data, extended=False, fd=False, brs=False):
             if not cb.is_inquiry(can_id, data, extended):
                 raise cb.Fail(cb.NOT_A_QUESTION)
-            sent.append((can_id, bytes(data)))
+            sent.append((can_id, bytes(data), extended))
 
         cb.PeakBus.open_transmit = fake_open
         cb.PeakBus.send = fake_send
@@ -298,22 +320,31 @@ class DecodeTests(unittest.TestCase):
             self.assertEqual(cb.main(["send", "--uds", "--bitrate", "250000"]), 2)
             self.assertEqual(opened, [])
             self.assertEqual(cb.main(["send", "--id", "7E0", "--data", "02 27 01", "--classic"]), 2)
+            self.assertEqual(cb.main(["send", "--id", "7E0", "--data", "02 10 03", "--classic"]), 2)
+            self.assertEqual(cb.main(["send", "--id", "18DAF110", "--data", "02 3E 00", "--classic"]), 2)
             self.assertEqual(cb.main(["send", "--id", "CF00400", "--data", "03 22 F1 90", "--classic", "--extended"]), 2)
+            self.assertEqual(cb.main(["send", "--uds", "--target", "F1"]), 2)
             self.assertEqual(opened, [])
             self.assertEqual(cb.main(["send", "--uds"]), 0)
-            self.assertEqual(cb.main(["send", "--id", "7E0", "--data", "02 10 03", "--classic"]), 0)
-            self.assertEqual(cb.main(["send", "--id", "7DF", "--data", "02 3E 80", "--classic"]), 0)
+            self.assertEqual(cb.main(["send", "--uds", "--target", "10"]), 0)
+            self.assertEqual(cb.main(["send", "--id", "18DBFFF1", "--data", "02 10 03", "--classic"]), 0)
         finally:
             cb.PeakBus.open_transmit, cb.PeakBus.send, cb.PeakBus.close = real_open, real_send, real_close
         self.assertEqual(opened, [(True, 500000), (True, 500000), (True, 500000)])
-        self.assertEqual(len(sent), 6)
-        for can_id, data in sent:
-            self.assertTrue(cb.is_inquiry(can_id, data, can_id > 0x7FF))
+        self.assertEqual(len(sent), 9)
+        ids = [can_id for can_id, _data, _ext in sent]
+        self.assertEqual(ids[:4], [0x18DBFFF1] * 4)
+        self.assertEqual(ids[4:8], [0x18DA10F1] * 4)
+        self.assertEqual(ids[8], 0x18DBFFF1)
+        for can_id, data, ext in sent:
+            self.assertTrue(ext)
+            self.assertTrue(cb.is_inquiry(can_id, data, ext))
             self.assertNotIn(data[1], cb.BLOCKED_SERVICES)
         buf = io.StringIO()
         with redirect_stdout(buf):
             self.assertEqual(cb.main([]), 0)
         self.assertIn("可以问，不能改", buf.getvalue())
+        self.assertIn("18DBFFF1", buf.getvalue())
 
 
 if __name__ == "__main__":

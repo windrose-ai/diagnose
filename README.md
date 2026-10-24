@@ -10,13 +10,17 @@ DBC that you supply.
 
 - **可以问，不能改。** Peak (PCAN) may transmit on the diagnostic CAN only:
   OBD pins 6 and 14, classic CAN at 500 kbit/s, via TGW / GWCANFD9.
-  `send --uds` polls that interface. Recording stays listen-only.
+  Recording stays listen-only.
+- **WH13 / E700 UDS ids (29-bit).** `send --uds` asks on functional `0x18DBFFF1`
+  (tester source `0xF1`). `send --uds --target xx` asks on physical `0x18DAxxF1`.
+  Responses come back on `0x18DAF1xx` and are never transmitted. 11-bit `0x7DF`
+  is not the WH13 UDS address.
 - **Allowed transmit (ask).** The allowlist is explicit:
   - UDS `$10` DiagnosticSessionControl, default (`01`) or extended (`03`) only, so a later read can run
   - UDS `$3E` TesterPresent, sub-function `00`, to keep that read session
   - UDS `$22` ReadDataByIdentifier
   - UDS `$19` ReadDTCInformation
-  - Classic J1979 Mode `01` and `09` requests, already supported, plus the other read-only modes already in the tool (`02`, `03`, `05`, `06`, `07`, `0A`)
+  - Classic J1979 Mode `01` and `09` requests, already supported, plus the other read-only modes already in the tool (`02`, `03`, `05`, `06`, `07`, `0A`), on legacy ids `0x7DF`, `0x7E0`–`0x7E7`, and `0x18DB33F1` only
   - Read-only J1939 requests (not DM3 / DM11) and the ISO-TP flow control that finishes a multi-frame read
 - **Still refused (hard block).** The transmit layer rejects anything that would change the vehicle, including:
   - Programming session (`$10` sub-function `02`) and flash / transfer (`$34`, `$35`, `$36`, `$37`, `$38`)
