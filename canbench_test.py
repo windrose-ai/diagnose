@@ -2,8 +2,10 @@
 # Copyright 2026 Windrose
 # Unit tests for canbench.py. No adapter and no network.
 import io
+import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,6 +13,8 @@ from contextlib import redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import canbench as cb
+
+cb.set_lang("en")
 
 DBC = """
 BO_ 256 SpeedMsg: 8 Vector__XXX
@@ -52,7 +56,9 @@ class DecodeTests(unittest.TestCase):
         page = cb.plot_html(cb.load_asc(ASC), dbc)
         self.assertIn("<svg", page)
         self.assertIn("#f6f5f2", page)
-        self.assertLess(page.find("You can ask. You cannot change."), page.find("可以问，不能改"))
+        self.assertIn("You can ask. You cannot change.", page)
+        self.assertNotIn("可以问，不能改", page)
+        self.assertIn('lang="en"', page)
         self.assertIn("CAN adapter (Peak, ZLG, …)", page)
         self.assertIn("VehicleSpeed", page)
         self.assertNotIn("EngineSpeed", page)
@@ -111,7 +117,7 @@ class DecodeTests(unittest.TestCase):
 
         def fake_send(self, can_id, data, extended=False, fd=False, brs=False):
             if not cb.is_inquiry(can_id, data, extended):
-                raise cb.Fail(cb.NOT_A_QUESTION)
+                raise cb.Fail(cb.t("not_a_question"))
             sent.append(can_id)
 
         cb.PeakBus.open_transmit = fake_open
@@ -186,7 +192,7 @@ class DecodeTests(unittest.TestCase):
 
         def fake_send(self, can_id, data, extended=False, fd=False, brs=False):
             if not cb.is_inquiry(can_id, data, extended):
-                raise cb.Fail(cb.NOT_A_QUESTION)
+                raise cb.Fail(cb.t("not_a_question"))
             sent.append(can_id)
 
         cb.PeakBus.open_transmit = fake_open
@@ -310,7 +316,7 @@ class DecodeTests(unittest.TestCase):
 
         def fake_send(self, can_id, data, extended=False, fd=False, brs=False):
             if not cb.is_inquiry(can_id, data, extended):
-                raise cb.Fail(cb.NOT_A_QUESTION)
+                raise cb.Fail(cb.t("not_a_question"))
             sent.append((can_id, bytes(data), extended))
 
         cb.PeakBus.open_transmit = fake_open
@@ -348,7 +354,7 @@ class DecodeTests(unittest.TestCase):
             self.assertEqual(cb.main([]), 0)
         help_text = buf.getvalue()
         self.assertTrue(help_text.startswith("You can ask. You cannot change."))
-        self.assertLess(help_text.find("You can ask"), help_text.find("可以问，不能改"))
+        self.assertNotIn("可以问，不能改", help_text)
         self.assertIn("18DBFFF1", help_text)
         self.assertIn("CAN adapter (Peak, ZLG, …)", buf.getvalue())
 
@@ -390,7 +396,7 @@ class DecodeTests(unittest.TestCase):
                     port.send(0x18DBFFF1, data, extended=True)
                 message = str(caught.exception)
                 self.assertTrue(message.startswith("This frame is not a read-only question."))
-                self.assertLess(message.find("This frame"), message.find("可以问，不能改"))
+                self.assertNotIn("可以问", message)
             with self.assertRaises(cb.Fail) as caught:
                 port.send(*good)
             self.assertNotIn("可以问，不能改", str(caught.exception))
@@ -401,10 +407,10 @@ class DecodeTests(unittest.TestCase):
             cb.plain_adapter_name("", "", 0x1234, 0xABCD),
             "unknown USB-CAN, VID:PID 1234:abcd",
         )
-        self.assertEqual(cb.explain_failure(cb.Fail(cb.NOT_A_QUESTION)), cb.PLAIN_BOUNDARY)
-        self.assertEqual(cb.explain_failure(cb.Fail("PCAN-Basic library not found")), cb.PLAIN_DRIVER)
-        self.assertEqual(cb.explain_failure(cb.Fail("bitrate is 250000 bit/s")), cb.PLAIN_BITRATE)
-        self.assertEqual(cb.explain_failure(cb.Fail("Network is down")), cb.PLAIN_POWER)
+        self.assertEqual(cb.explain_failure(cb.Fail(cb.t("not_a_question"))), cb.t("plain_boundary"))
+        self.assertEqual(cb.explain_failure(cb.Fail("PCAN-Basic library not found")), cb.t("plain_driver"))
+        self.assertEqual(cb.explain_failure(cb.Fail("bitrate is 250000 bit/s")), cb.t("plain_bitrate"))
+        self.assertEqual(cb.explain_failure(cb.Fail("Network is down")), cb.t("plain_power"))
         with tempfile.TemporaryDirectory() as root:
             usb = os.path.join(root, "bus", "usb", "devices", "1-2")
             os.makedirs(usb)
@@ -444,10 +450,10 @@ class DecodeTests(unittest.TestCase):
             self.assertEqual(zlg[0]["plain"], "ZLG USBCAN")
             self.assertFalse(zlg[0]["ready"])
         quiet = cb.run_connect(found=[])
-        self.assertIn(cb.PLAIN_NOTHING, "\n".join(quiet["lines"]))
+        self.assertIn(cb.t("plain_nothing"), "\n".join(quiet["lines"]))
         self.assertEqual(quiet["asked"], [])
         missing = cb.run_connect(found=[{"plain": "Peak PCAN-USB", "ready": False, "backend": "peak"}])
-        self.assertIn(cb.PLAIN_DRIVER, "\n".join(missing["lines"]))
+        self.assertIn(cb.t("plain_driver"), "\n".join(missing["lines"]))
         self.assertEqual(missing["asked"], [])
 
         class Box:
@@ -499,20 +505,21 @@ class DecodeTests(unittest.TestCase):
             open_port=lambda *args, **kwargs: slow,
         )
         self.assertFalse(denied["ok"])
-        self.assertIn(cb.PLAIN_BITRATE, "\n".join(denied["lines"]))
+        self.assertIn(cb.t("plain_bitrate"), "\n".join(denied["lines"]))
         self.assertEqual(slow.sent, [])
         dead = Box(fail="Network is down")
         powered = cb.run_connect(
             found=[{"plain": "SocketCAN can0", "backend": "socketcan", "iface": "can0", "ready": True}],
             open_port=lambda *args, **kwargs: dead,
         )
-        self.assertIn(cb.PLAIN_POWER, "\n".join(powered["lines"]))
+        self.assertIn(cb.t("plain_power"), "\n".join(powered["lines"]))
         page = cb.connect_html(
             [{"plain": "unknown USB-CAN, VID:PID 1234:abcd"}],
-            [cb.ASK_ONLY],
+            [cb.t("ask_only")],
         )
         self.assertIn("unknown USB-CAN, VID:PID 1234:abcd", page)
-        self.assertLess(page.find("You can ask. You cannot change."), page.find("可以问，不能改"))
+        self.assertIn("You can ask. You cannot change.", page)
+        self.assertNotIn("可以问，不能改", page)
         self.assertIn("do not need to know the brand", page)
         real_enum = cb.enumerate_adapters
         cb.enumerate_adapters = lambda *args, **kwargs: []
@@ -520,9 +527,55 @@ class DecodeTests(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 self.assertEqual(cb.main(["connect"]), 0)
-            self.assertIn(cb.PLAIN_NOTHING, buf.getvalue())
+            self.assertIn(cb.t("plain_nothing"), buf.getvalue())
         finally:
             cb.enumerate_adapters = real_enum
+
+    def test_locale_is_one_language(self):
+        site = ["en", "zh", "zh_tw", "fr", "de", "es", "it", "pt", "nl", "pl", "sv", "da", "no", "fi", "is", "tr", "ar", "he", "ja", "ko"]
+        self.assertEqual(list(cb.LANGS), site)
+        keys = set(cb.COPY["en"])
+        for code in site:
+            self.assertEqual(set(cb.COPY[code]), keys, code)
+            ask = cb.COPY[code]["ask_only"]
+            self.assertFalse("You can ask" in ask and "可以" in ask, code)
+        self.assertEqual(cb.norm_lang("en-US"), "en")
+        self.assertEqual(cb.norm_lang("zh-CN"), "zh")
+        self.assertEqual(cb.norm_lang("zh-TW"), "zh_tw")
+        self.assertEqual(cb.norm_lang("nb-NO"), "no")
+        self.assertEqual(cb.norm_lang("ja"), "ja")
+        self.assertEqual(cb.norm_lang("xx"), "")
+        self.assertEqual(cb.t("ask_only", "xx"), cb.COPY["en"]["ask_only"])
+        cb.set_lang("zh")
+        try:
+            self.assertEqual(cb.t("ask_only"), "可以问，不能改")
+            page = cb.connect_html([], [])
+            self.assertIn("可以问，不能改", page)
+            self.assertNotIn("You can ask", page)
+            self.assertIn('lang="zh-CN"', page)
+            cb.set_lang("he")
+            self.assertIn('dir="rtl"', cb.connect_html([], []))
+        finally:
+            cb.set_lang("en")
+        old = os.environ.get("WR_LANG")
+        os.environ["WR_LANG"] = "de"
+        cb.reset_lang()
+        try:
+            self.assertEqual(cb.active_lang(), "de")
+            self.assertEqual(cb.t("ask_only"), cb.COPY["de"]["ask_only"])
+        finally:
+            if old is None:
+                os.environ.pop("WR_LANG", None)
+            else:
+                os.environ["WR_LANG"] = old
+            cb.set_lang("en")
+        raw = subprocess.check_output(
+            ["node", "-e", "var c=require('./canbench.js'); process.stdout.write(JSON.stringify({langs:c.langs, copy:c.copy}))"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        got = json.loads(raw.decode("utf-8"))
+        self.assertEqual(got["langs"], site)
+        self.assertEqual(got["copy"], cb.COPY)
 
 
 if __name__ == "__main__":

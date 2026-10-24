@@ -7,12 +7,13 @@
 # Recording stays listen-only. The ask path is a CAN adapter (Peak, ZLG, …):
 # PCAN-Basic, ZLG ControlCAN, or SocketCAN, classic ~500 kbit/s.
 # PCAN-USB FD does not speak CAN XL.
-# CANBENCH_REV = "2026-10-24.2"
+# CANBENCH_REV = "2026-10-24.5"
 
 from __future__ import annotations
 
 import ctypes
 import html
+import json
 import os
 import re
 import socket
@@ -20,7 +21,7 @@ import struct
 import sys
 import time
 
-CANBENCH_REV = "2026-10-24.4"
+CANBENCH_REV = "2026-10-24.5"
 ADAPTER_LABEL = "CAN adapter (Peak, ZLG, …)"
 CH1 = 0x51  # PCAN_USBBUS1
 LISTEN_ONLY = 0x08
@@ -82,17 +83,73 @@ WH13_FUNCTIONAL = 0x18DBFFF1
 # J1979 legacy only. UDS asks are not sent on these ids.
 J1979_FUNCTIONAL = 0x7DF
 J1979_FUNCTIONAL_EXT = 0x18DB33F1
-ASK_ONLY = "You can ask. You cannot change. 可以问，不能改"
-BUS_NOTE = (
-    "Asking only. Nothing on the truck is changed. "
-    "CAN XL is not available on PCAN-USB FD. "
-    "可以问，不能改。"
-)
-UDS_BUS_NOTE = (
-    "UDS asks go out on the diagnostic CAN only "
-    "(OBD pins 6/14, classic 500 kbit/s via TGW / GWCANFD9, "
-    "29-bit functional 0x18DBFFF1 or physical 0x18DAxxF1)."
-)
+# One language at a time, same codes as windrose.ai/translations.js.
+# English is always the fallback. WR_LANG or --lang picks the other catalog.
+def _load_i18n():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "canbench_i18n.json")
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    return tuple(data["langs"]), data["copy"]
+
+
+LANGS, COPY = _load_i18n()
+_LANG_ALIAS = {
+    "en_world": "en", "en_us": "en", "en_uk": "en", "en_au": "en",
+    "zh_cn": "zh", "zh_hans": "zh", "zh_hant": "zh_tw",
+    "nb": "no", "nn": "no", "iw": "he",
+}
+_LANG = None
+
+
+def norm_lang(raw):
+    """Fold a language tag the way the website does. Empty string means unknown."""
+    text = str(raw or "").strip().lower().replace("-", "_")
+    if not text:
+        return ""
+    text = _LANG_ALIAS.get(text, text)
+    if text in LANGS:
+        return text
+    two = _LANG_ALIAS.get(text.split("_")[0], text.split("_")[0])
+    return two if two in LANGS else ""
+
+
+def set_lang(lang):
+    """Pin the language for this process. Unknown tags become English."""
+    global _LANG
+    _LANG = norm_lang(lang) or "en"
+
+
+def reset_lang():
+    """Follow WR_LANG again, then English. This is what a fresh process does."""
+    global _LANG
+    _LANG = None
+
+
+def active_lang():
+    if _LANG is not None:
+        return _LANG
+    return norm_lang(os.environ.get("WR_LANG") or "") or "en"
+
+
+def t(key, lang=None):
+    """One string from the active catalog. Missing keys and languages use English."""
+    code = norm_lang(lang) if lang is not None else active_lang()
+    pack = COPY.get(code or "en") or COPY["en"]
+    if key not in pack:
+        pack = COPY["en"]
+    return pack[key]
+
+
+def html_locale():
+    """html lang tag and dir. Arabic and Hebrew are right to left, as on the site."""
+    code = active_lang()
+    if code == "zh":
+        tag = "zh-CN"
+    elif code == "zh_tw":
+        tag = "zh-TW"
+    else:
+        tag = code
+    return tag, ("rtl" if code in ("ar", "he") else "ltr")
 # Transmit allowlist. A service id that is not listed is refused.
 # Keep these sets in sync with canbench.js.
 # $10 is listed, and only default (0x01) and extended (0x03) sub-functions pass.
@@ -127,13 +184,6 @@ BLOCKED_SERVICES = frozenset((
     0x86,  # ResponseOnEvent
     0x87,  # LinkControl
 ))
-NOT_A_QUESTION = (
-    "This frame is not a read-only question. "
-    "Clear, reset, write, flash, security access, and control are not sent. "
-    "可以问，不能改。"
-)
-
-
 class Fail(Exception):
     pass
 
@@ -269,7 +319,7 @@ def j1939_request_frame(name):
     data = bytes((pgn & 0xFF, (pgn >> 8) & 0xFF, (pgn >> 16) & 0xFF)) + b"\xff" * 5
     frame = (0x18EAFFFE, data, True)
     if not is_j1939_read_request(frame[0], frame[1], frame[2]):
-        raise Fail(NOT_A_QUESTION)
+        raise Fail(t("not_a_question"))
     return frame
 
 
@@ -341,7 +391,7 @@ def uds_read_frames(session="extended", target=None):
     for body in bodies:
         frame = (can_id, _pad8(body), True)
         if not is_inquiry(frame[0], frame[1], frame[2]):
-            raise Fail(NOT_A_QUESTION)
+            raise Fail(t("not_a_question"))
         frames.append(frame)
     return frames
 
@@ -637,7 +687,7 @@ def _changed_series(rows):
 def plot_html(frames, dbc, title="CAN plot"):
     series = _changed_series(decode(frames, dbc))
     parts = [
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>",
+        "<!DOCTYPE html><html lang=\"%s\" dir=\"%s\"><head><meta charset=\"utf-8\"><title>" % html_locale(),
         html.escape(title),
         "</title><style>",
         "body{background:#f6f5f2;color:#1c1c1c;font:14px -apple-system,BlinkMacSystemFont,sans-serif;margin:24px}",
@@ -647,16 +697,14 @@ def plot_html(frames, dbc, title="CAN plot"):
         "</style></head><body><h1>",
         html.escape(title),
         "</h1><p class=\"policy\">",
-        html.escape(ASK_ONLY),
+        html.escape(t("ask_only")),
         "</p>",
         "<p class=\"note\">",
-        "Plug in a USB-CAN dongle. You do not need to know the brand. ",
-        ADAPTER_LABEL,
-        ". Local file. It is not sent to the assistant. ",
-        "Read-only questions only; the vehicle is not changed.</p>",
+        html.escape(t("plot_note")),
+        "</p>",
     ]
     if not series:
-        parts.append("<p>No signal in this recording changed value.</p>")
+        parts.append("<p>%s</p>" % html.escape(t("plot_empty")))
     width, height, pad = 720, 140, 28
     for (message, signal, unit), pts in series:
         t0 = pts[0]["t"]
@@ -944,9 +992,9 @@ def guard_transmit(bus, can_id, data, extended):
         raise Fail("Call open_transmit() before send().")
     data = bytes(data)
     if not is_inquiry(can_id, data, extended):
-        raise Fail(NOT_A_QUESTION)
+        raise Fail(t("not_a_question"))
     if _uds_ask_frame(data) and (not bus.classic or bus.bitrate != DIAGNOSTIC_BITRATE):
-        raise Fail(UDS_BUS_NOTE)
+        raise Fail(t("uds_bus"))
     return data
 
 
@@ -1422,33 +1470,8 @@ KNOWN_USB_CAN = {
     (0x0471, 0x1200): ("ZLG USBCAN", "zlg"),
     (0x1D50, 0x606F): ("candleLight USB-CAN", "socketcan"),
 }
-# A response the vehicle sends after a read. These names are ISO 14229, not a truck DBC.
-PUBLIC_UDS = {
-    0x50: "diagnostic session",
-    0x59: "fault information",
-    0x62: "data value",
-    0x7E: "tester still present",
-    0x7F: "the vehicle declined the question",
-}
-PLAIN_NOTHING = (
-    "Nothing is plugged in. Plug a USB-CAN dongle into this computer. "
-    "You do not need to know if it is Peak, ZLG, or another brand."
-)
-PLAIN_DRIVER = (
-    "The adapter driver is missing. Install the driver that came with the dongle, then plug it in again. "
-    "You do not need to choose Peak or ZLG."
-)
-PLAIN_BITRATE = (
-    "The dongle is at the wrong bitrate. The diagnostic plug needs classic CAN at 500 kbit/s."
-)
-PLAIN_POWER = (
-    "The vehicle bus has no power, or the diagnostic cable is not seated. "
-    "Turn the ignition on and check OBD pins 6 and 14."
-)
-PLAIN_BOUNDARY = (
-    "This tool only asks for data. It will not write, flash, unlock, or command the vehicle. "
-    "可以问，不能改。"
-)
+# Response names are ISO 14229, one language at a time. Keys: uds_50, uds_59, uds_62, uds_7e, uds_7f.
+_UDS_NAME = {0x50: "uds_50", 0x59: "uds_59", 0x62: "uds_62", 0x7E: "uds_7e", 0x7F: "uds_7f"}
 
 
 def _read_text(path):
@@ -1622,20 +1645,21 @@ def enumerate_adapters(sys_root="/sys", libs=None):
 
 
 def explain_failure(exc):
-    """Plain reason. The four cases are bitrate, bus power, missing driver, and ask versus write."""
+    """Plain reason in the active language. Bitrate, bus power, missing driver, or ask versus write."""
     text = str(exc)
     low = text.lower()
-    if "可以问" in text or "not a read-only" in low or "not a question" in low:
-        return PLAIN_BOUNDARY
+    boundary = any(pack.get("not_a_question") and pack["not_a_question"] in text for pack in COPY.values())
+    if boundary or "not a read-only" in low or "not a question" in low:
+        return t("plain_boundary")
     if "bit/s" in low or "bitrate" in low or "kbit" in low:
-        return PLAIN_BITRATE
+        return t("plain_bitrate")
     if "library not found" in low or "driver is missing" in low or "driver" in low and "not found" in low:
-        return PLAIN_DRIVER
+        return t("plain_driver")
     if any(bit in low for bit in (
         "network is down", "enetdown", "no such device", "opendevice", "no power",
         "not open", "startcan", "initcan", "bus has no power",
     )):
-        return PLAIN_POWER
+        return t("plain_power")
     return text
 
 
@@ -1670,28 +1694,30 @@ def decode_public(frames):
             continue
         sid = payload[0]
         if sid == 0x7F and len(payload) >= 3 and payload[2] == 0x33:
-            lines.append("Response 0x%X: the vehicle asked for a security unlock. This tool will not unlock it." % can_id)
+            lines.append(t("response") % (can_id, t("uds_locked")))
             continue
-        name = PUBLIC_UDS.get(sid, "")
-        if name:
-            lines.append("Response 0x%X: %s." % (can_id, name))
+        key = _UDS_NAME.get(sid)
+        if key:
+            lines.append(t("response") % (can_id, t(key)))
         else:
-            lines.append("Response 0x%X: %d bytes, not in the public dictionary." % (can_id, len(data)))
+            lines.append(t("response_unknown") % (can_id, len(data)))
     return "\n".join(lines) + ("\n" if lines else "")
 
 
 def connect_html(found, lines):
     """The page shown when Diagnose opens. Brand is a name, not a choice the user must make."""
+    tag, direction = html_locale()
+    nothing = t("plain_nothing")
     body = [
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Windrose Diagnose</title>",
+        "<!DOCTYPE html><html lang=\"%s\" dir=\"%s\"><head><meta charset=\"utf-8\"><title>Windrose Diagnose</title>" % (html.escape(tag), direction),
         "<style>body{background:#f6f5f2;color:#1c1c1c;font:15px -apple-system,sans-serif;margin:24px}",
         "p.policy{font-weight:600}li{margin:6px 0}</style></head><body>",
         "<h1>Windrose Diagnose</h1>",
-        "<p class=\"policy\">%s</p>" % html.escape(ASK_ONLY),
-        "<p>Plug in a USB-CAN dongle. You do not need to know the brand.</p>",
+        "<p class=\"policy\">%s</p>" % html.escape(t("ask_only")),
+        "<p>%s</p>" % html.escape(t("plug_brand")),
     ]
-    if not found and not any(PLAIN_NOTHING in (line or "") for line in lines):
-        body.append("<p>%s</p>" % html.escape(PLAIN_NOTHING))
+    if not found and not any(nothing in (line or "") for line in lines):
+        body.append("<p>%s</p>" % html.escape(nothing))
     if found:
         body.append("<ul>")
         for dev in found:
@@ -1707,16 +1733,16 @@ def run_connect(found=None, open_port=None, libs=None):
     """Enumerate, name, and when a dongle is ready ask read-only UDS at classic 500 kbit/s."""
     if found is None:
         found = enumerate_adapters(libs=libs)
-    lines = [ASK_ONLY]
+    lines = [t("ask_only")]
     asked = []
     heard = []
     if not found:
-        lines.append(PLAIN_NOTHING)
+        lines.append(t("plain_nothing"))
         return {"ok": False, "found": found, "lines": lines, "asked": asked, "heard": heard}
-    lines.append("Found: %s." % "; ".join(dev["plain"] for dev in found))
+    lines.append(t("found") % "; ".join(dev["plain"] for dev in found))
     ready = [dev for dev in found if dev.get("ready")]
     if not ready:
-        lines.append(PLAIN_DRIVER)
+        lines.append(t("plain_driver"))
         return {"ok": False, "found": found, "lines": lines, "asked": asked, "heard": heard}
     if open_port is None:
         open_port = open_can_port
@@ -1732,19 +1758,14 @@ def run_connect(found=None, open_port=None, libs=None):
                 asked.append((can_id, bytes(data), ext))
             if hasattr(port, "read_frames"):
                 heard = list(port.read_frames(0.05) or [])
-            lines.append(
-                "Asked %s for session, fault codes, and VIN on 0x18DBFFF1. Nothing on the vehicle was changed."
-                % dev["plain"]
-            )
+            lines.append(t("asked") % dev["plain"])
             if heard:
-                lines.append("Heard traffic and decoded it with the public dictionary.")
+                lines.append(t("heard"))
                 text = decode_public(heard).strip()
                 if text:
                     lines.append(text)
             else:
-                lines.append(
-                    "No messages came back. Turn the ignition on and seat the cable on the diagnostic plug."
-                )
+                lines.append(t("quiet_bus"))
             return {"ok": True, "found": found, "lines": lines, "asked": asked, "heard": heard}
         except Fail as exc:
             last = exc
@@ -1752,7 +1773,8 @@ def run_connect(found=None, open_port=None, libs=None):
         finally:
             if port is not None:
                 port.close()
-    if last is not None and PLAIN_DRIVER not in lines[-1] and PLAIN_BITRATE not in lines[-1] and PLAIN_POWER not in lines[-1] and PLAIN_BOUNDARY not in lines[-1]:
+    plain = (t("plain_driver"), t("plain_bitrate"), t("plain_power"), t("plain_boundary"))
+    if last is not None and not any(sentence in lines[-1] for sentence in plain):
         lines.append(explain_failure(last))
     return {"ok": False, "found": found, "lines": lines, "asked": asked, "heard": heard}
 
@@ -1894,13 +1916,13 @@ def _cmd_send(argv):
         frames = standard_questions()
     for can_id, data, ext in frames:
         if not is_inquiry(can_id, data, ext):
-            raise Fail(NOT_A_QUESTION)
+            raise Fail(t("not_a_question"))
         if _uds_ask_frame(data) and (not classic or bitrate != DIAGNOSTIC_BITRATE):
-            raise Fail(UDS_BUS_NOTE)
+            raise Fail(t("uds_bus"))
     fd = False
-    print(BUS_NOTE)
+    print(t("bus_note"))
     if any(_uds_ask_frame(data) for _can_id, data, _ext in frames):
-        print(UDS_BUS_NOTE)
+        print(t("uds_bus"))
     bus = open_can_port(
         _opt(argv, "--adapter", "auto"),
         lib_path=_opt(argv, "--lib", ""),
@@ -1934,17 +1956,42 @@ def _cmd_connect(argv):
     return 2
 
 
+def _pull_lang(argv):
+    """--lang wins over WR_LANG. Unknown codes become English, same as the site."""
+    out = []
+    chosen = None
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("--lang", "-lang"):
+            if i + 1 >= len(argv):
+                raise Fail("missing value after %s" % argv[i])
+            chosen = argv[i + 1]
+            i += 2
+            continue
+        out.append(argv[i])
+        i += 1
+    if chosen is not None:
+        set_lang(chosen)
+    return out
+
+
 def main(argv):
+    try:
+        argv = _pull_lang(list(argv))
+    except Fail as exc:
+        sys.stderr.write(str(exc) + "\n")
+        return 2
     if not argv or argv[0] in ("-h", "--help", "help"):
-        print(ASK_ONLY)
-        print("Plug in a USB-CAN dongle, then: connect")
-        print("You do not need to know if it is Peak, ZLG, or another brand.")
+        print(t("ask_only"))
+        print(t("help_plug"))
+        print(t("help_brand"))
+        print(t("help_lang"))
         print(ADAPTER_LABEL)
         found = enumerate_adapters()
         if found:
-            print("Plugged in: %s." % "; ".join(dev["plain"] for dev in found))
+            print(t("plugged_in") % "; ".join(dev["plain"] for dev in found))
         else:
-            print(PLAIN_NOTHING)
+            print(t("plain_nothing"))
         print("plot FILE.asc [--dbc FILE]")
         print("j1939 FILE.asc")
         print("decode FILE.asc [--dbc FILE]")

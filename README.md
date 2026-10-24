@@ -1,6 +1,8 @@
 # Windrose Diagnose
 
-**You can ask. You cannot change.** 可以问，不能改。 Windrose Diagnose listens, and it may ask a read-only diagnostic question. It never writes to the vehicle.
+**You can ask. You cannot change.** Windrose Diagnose listens, and it may ask a read-only diagnostic question. It never writes to the vehicle.
+
+The words are one language at a time, the same list as [windrose.ai](https://www.windrose.ai): `en`, `zh`, `zh_tw`, `fr`, `de`, `es`, `it`, `pt`, `nl`, `pl`, `sv`, `da`, `no`, `fi`, `is`, `tr`, `ar`, `he`, `ja`, `ko`. Set `WR_LANG` or pass `--lang`. An empty or unknown tag stays English. `zh-CN` is simplified Chinese and `zh-TW` is traditional.
 
 Windrose Diagnose connects to a vehicle CAN bus to **read** — vehicle speed, fault
 codes, VIN, software and component identifiers — plots signals, and decodes a
@@ -43,7 +45,8 @@ DBC that you supply.
 | File | What it is |
 |---|---|
 | `canbench.py` | Command-line tool. **Python 3.9 standard library only** — no third-party packages. |
-| `canbench.js` | The same bench logic for a browser read page (UMD module). |
+| `canbench_i18n.json` | The same twenty languages as the website. English is the fallback. |
+| `canbench.js` | The same bench logic for a browser read page (UMD module), including that catalog. |
 | `canbench_test.py`, `canbench_test.js` | Unit tests. |
 
 ## Quick start
@@ -51,6 +54,7 @@ DBC that you supply.
 ```sh
 python3 canbench.py            # what is plugged in
 python3 canbench.py connect    # ask the vehicle, read-only
+WR_LANG=zh python3 canbench.py # same screen, simplified Chinese
 python3 canbench_test.py       # run the tests
 ```
 
@@ -58,7 +62,7 @@ Hardware: plug in a USB-CAN dongle. Peak, ZLG, SocketCAN, and other USB-CAN devi
 
 ## Scope and safety
 
-You can ask. You cannot change. 可以问，不能改。 This tool asks read-only diagnostic questions on the diagnostic
+You can ask. You cannot change. This tool asks read-only diagnostic questions on the diagnostic
 CAN and never writes, flashes, unlocks, or commands the vehicle. Use it on
 buses and vehicles you are authorized to access.
 
