@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Windrose
 # Unit tests for canbench.py. No adapter and no network.
+import io
+import json
 import os
+import struct
+import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import canbench as cb
+
+cb.set_lang("en")
 
 DBC = """
 BO_ 256 SpeedMsg: 8 Vector__XXX
@@ -49,6 +56,10 @@ class DecodeTests(unittest.TestCase):
         page = cb.plot_html(cb.load_asc(ASC), dbc)
         self.assertIn("<svg", page)
         self.assertIn("#f6f5f2", page)
+        self.assertIn("You can ask. You cannot change.", page)
+        self.assertNotIn("可以问，不能改", page)
+        self.assertIn('lang="en"', page)
+        self.assertIn("CAN adapter (Peak, ZLG, …)", page)
         self.assertIn("VehicleSpeed", page)
         self.assertNotIn("EngineSpeed", page)
 
@@ -85,7 +96,10 @@ class DecodeTests(unittest.TestCase):
         self.assertTrue(cb.is_inquiry(0x7DF, bytes.fromhex("02010D"), False))
         self.assertTrue(cb.is_inquiry(0x18DB33F1, bytes.fromhex("020902"), True))
         self.assertTrue(cb.is_inquiry(0x7E0, bytes.fromhex("300000"), False))
-        self.assertTrue(cb.is_inquiry(0x7E0, bytes.fromhex("0322F190"), False))
+        self.assertTrue(cb.is_inquiry(0x18DBFFF1, bytes.fromhex("0322F190"), True))
+        self.assertFalse(cb.is_inquiry(0x7E0, bytes.fromhex("0322F190"), False))
+        legacy = {can_id for can_id, _data, _ext in cb.standard_questions()}
+        self.assertEqual(legacy, {0x7DF, 0x18DB33F1})
         self.assertFalse(cb.is_inquiry(0x7DF, bytes.fromhex("032EF190"), False))
         self.assertFalse(cb.is_inquiry(0x7DF, bytes.fromhex("0104"), False))
         self.assertFalse(cb.is_inquiry(0x7DF, bytes.fromhex("023101"), False))
@@ -103,7 +117,7 @@ class DecodeTests(unittest.TestCase):
 
         def fake_send(self, can_id, data, extended=False, fd=False, brs=False):
             if not cb.is_inquiry(can_id, data, extended):
-                raise cb.Fail(cb.NOT_A_QUESTION)
+                raise cb.Fail(cb.t("not_a_question"))
             sent.append(can_id)
 
         cb.PeakBus.open_transmit = fake_open
@@ -115,6 +129,7 @@ class DecodeTests(unittest.TestCase):
             self.assertEqual(cb.main(["send", "--symbol", "Speed.A=1"]), 2)
             self.assertEqual(opened, [])
             self.assertEqual(cb.main(["send", "--id", "7DF", "--data", "01 04"]), 2)
+            self.assertEqual(cb.main(["send", "--id", "7DF", "--data", "02 10 02", "--classic"]), 2)
             self.assertEqual(cb.main(["send", "--id", "7DF", "--data", "02 10 03"]), 2)
             self.assertEqual(cb.main(["send", "--id", "7DF", "--data", "02 01 0D", "--period", "100"]), 2)
             self.assertEqual(opened, [])
@@ -177,7 +192,7 @@ class DecodeTests(unittest.TestCase):
 
         def fake_send(self, can_id, data, extended=False, fd=False, brs=False):
             if not cb.is_inquiry(can_id, data, extended):
-                raise cb.Fail(cb.NOT_A_QUESTION)
+                raise cb.Fail(cb.t("not_a_question"))
             sent.append(can_id)
 
         cb.PeakBus.open_transmit = fake_open
@@ -208,6 +223,383 @@ class DecodeTests(unittest.TestCase):
                 self.assertIn("<svg", handle.read())
             self.assertEqual(cb.main(["j1939", asc]), 0)
             self.assertIn("km/h", dbc["messages"][256]["signals"][0]["unit"])
+
+    def test_uds_ask_allowlist_and_hard_block(self):
+        def frame(hex_bytes):
+            body = bytes.fromhex(hex_bytes)
+            return body + bytes(8 - len(body))
+
+        uds_ok = (
+            "021001", "021003", "021081", "021083",
+            "023E00", "023E80", "0322F190", "031902FF",
+        )
+        for raw in uds_ok:
+            self.assertTrue(cb.is_inquiry(0x18DBFFF1, frame(raw), True), raw)
+            self.assertTrue(cb.is_inquiry(0x18DA10F1, frame(raw), True), raw)
+            self.assertFalse(cb.is_inquiry(0x7DF, frame(raw), False), raw)
+            self.assertFalse(cb.is_inquiry(0x18DAF110, frame(raw), True), raw)
+            self.assertTrue(cb.service_is_read(bytes.fromhex(raw)[1:]), raw)
+        for raw in ("02010D", "020902", "0103"):
+            self.assertTrue(cb.is_inquiry(0x7DF, frame(raw), False), raw)
+            self.assertFalse(cb.is_inquiry(0x18DBFFF1, frame(raw), True), raw)
+            self.assertTrue(cb.service_is_read(bytes.fromhex(raw)[1:]), raw)
+        self.assertTrue(cb.is_inquiry(0x18DB33F1, frame("020902"), True))
+        self.assertFalse(cb.is_inquiry(0x18DB33F1, frame("0322F190"), True))
+        self.assertTrue(cb.is_inquiry(0x18DA10F1, bytes.fromhex("3000000000000000"), True))
+        self.assertFalse(cb.is_inquiry(0x18DAF110, bytes.fromhex("3000000000000000"), True))
+        blocked = (
+            "021002", "021082", "021004", "03100300",
+            "022701", "042702AABB", "023E01", "0222F1",
+            "021900", "032EF190", "072EF190010203",
+            "052FF1900300", "0431010203",
+            "07340011223344", "0135", "023601", "0137", "023801",
+            "021101", "0414FFFFFF", "0104", "020800",
+            "03280101", "023D00",
+        )
+        for raw in blocked:
+            self.assertFalse(cb.is_inquiry(0x18DBFFF1, frame(raw), True), raw)
+            self.assertFalse(cb.is_inquiry(0x7DF, frame(raw), False), raw)
+        self.assertFalse(cb.is_inquiry(0x0CF00400, frame("0322F190"), True))
+        self.assertFalse(cb.is_inquiry(0x18DA10F1, frame("021002"), True))
+        passed = []
+        wh13 = []
+        for sid in range(256):
+            probe = bytes((0x02, sid, 0x00)) + bytes(5)
+            if cb.is_inquiry(0x7DF, probe, False):
+                passed.append(sid)
+            if cb.is_inquiry(0x18DBFFF1, probe, True):
+                wh13.append(sid)
+        self.assertEqual(set(passed), set(cb.OBD_READ_SERVICES))
+        self.assertEqual(set(wh13), {0x3E})
+        self.assertTrue(cb.BLOCKED_SERVICES.isdisjoint(cb.UDS_ASK_SERVICES))
+        self.assertTrue(cb.BLOCKED_SERVICES.isdisjoint(cb.OBD_READ_SERVICES))
+        poll = cb.uds_read_frames("extended")
+        self.assertEqual([item[0] for item in poll], [0x18DBFFF1] * 4)
+        self.assertEqual([item[2] for item in poll], [True] * 4)
+        for can_id, data, ext in poll:
+            self.assertTrue(cb.is_inquiry(can_id, data, ext))
+        physical = cb.uds_read_frames("extended", 0x10)
+        self.assertEqual([item[0] for item in physical], [0x18DA10F1] * 4)
+        self.assertEqual(cb.wh13_request_id("10"), 0x18DA10F1)
+        self.assertEqual(bytes(poll[0][1][:3]), bytes.fromhex("021003"))
+        self.assertEqual(bytes(poll[1][1][:3]), bytes.fromhex("023E00"))
+        self.assertEqual(bytes(poll[2][1][:4]), bytes.fromhex("0322F190"))
+        self.assertEqual(bytes(poll[3][1][:4]), bytes.fromhex("031902FF"))
+        self.assertEqual(bytes(cb.uds_read_frames("default")[0][1][:3]), bytes.fromhex("021001"))
+        with self.assertRaises(cb.Fail):
+            cb.uds_read_frames("programming")
+        bare = cb.PeakBus()
+        bare.transmitting = True
+        bare.classic = False
+        bare.bitrate = cb.DIAGNOSTIC_BITRATE
+        with self.assertRaises(cb.Fail) as caught:
+            bare.send(0x18DBFFF1, bytes.fromhex("021003"), extended=True)
+        self.assertIn("0x18DBFFF1", str(caught.exception))
+        bare.classic = True
+        bare.bitrate = 250000
+        with self.assertRaises(cb.Fail):
+            bare.send(0x18DBFFF1, bytes.fromhex("021003"), extended=True)
+        bare.bitrate = cb.DIAGNOSTIC_BITRATE
+        with self.assertRaises(cb.Fail):
+            bare.send(0x18DBFFF1, bytes.fromhex("022701"), extended=True)
+        with self.assertRaises(cb.Fail):
+            bare.send(0x7DF, bytes.fromhex("021003"), extended=False)
+        with self.assertRaises(cb.Fail):
+            bare.send(0x0CF00400, bytes.fromhex("0322F190"), extended=True)
+        opened = []
+        sent = []
+        real_open, real_send, real_close = cb.PeakBus.open_transmit, cb.PeakBus.send, cb.PeakBus.close
+
+        def fake_open(self, classic=False, bitrate=500000):
+            opened.append((classic, bitrate))
+            self.transmitting = True
+
+        def fake_send(self, can_id, data, extended=False, fd=False, brs=False):
+            if not cb.is_inquiry(can_id, data, extended):
+                raise cb.Fail(cb.t("not_a_question"))
+            sent.append((can_id, bytes(data), extended))
+
+        cb.PeakBus.open_transmit = fake_open
+        cb.PeakBus.send = fake_send
+        cb.PeakBus.close = lambda self: None
+        try:
+            self.assertEqual(cb.main(["send", "--uds", "--session", "programming"]), 2)
+            self.assertEqual(opened, [])
+            self.assertEqual(cb.main(["send", "--uds", "--bitrate", "250000"]), 2)
+            self.assertEqual(opened, [])
+            self.assertEqual(cb.main(["send", "--id", "7E0", "--data", "02 27 01", "--classic"]), 2)
+            self.assertEqual(cb.main(["send", "--id", "7E0", "--data", "02 10 03", "--classic"]), 2)
+            self.assertEqual(cb.main(["send", "--id", "18DAF110", "--data", "02 3E 00", "--classic"]), 2)
+            self.assertEqual(cb.main(["send", "--id", "CF00400", "--data", "03 22 F1 90", "--classic", "--extended"]), 2)
+            self.assertEqual(cb.main(["send", "--uds", "--target", "F1"]), 2)
+            self.assertEqual(cb.main(["send", "--uds", "--adapter", "nope"]), 2)
+            self.assertEqual(opened, [])
+            self.assertEqual(cb.main(["send", "--uds"]), 0)
+            self.assertEqual(cb.main(["send", "--uds", "--target", "10"]), 0)
+            self.assertEqual(cb.main(["send", "--id", "18DBFFF1", "--data", "02 10 03", "--classic"]), 0)
+        finally:
+            cb.PeakBus.open_transmit, cb.PeakBus.send, cb.PeakBus.close = real_open, real_send, real_close
+        self.assertEqual(opened, [(True, 500000), (True, 500000), (True, 500000)])
+        self.assertEqual(len(sent), 9)
+        ids = [can_id for can_id, _data, _ext in sent]
+        self.assertEqual(ids[:4], [0x18DBFFF1] * 4)
+        self.assertEqual(ids[4:8], [0x18DA10F1] * 4)
+        self.assertEqual(ids[8], 0x18DBFFF1)
+        for can_id, data, ext in sent:
+            self.assertTrue(ext)
+            self.assertTrue(cb.is_inquiry(can_id, data, ext))
+            self.assertNotIn(data[1], cb.BLOCKED_SERVICES)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cb.main([]), 0)
+        help_text = buf.getvalue()
+        self.assertTrue(help_text.startswith("You can ask. You cannot change."))
+        self.assertNotIn("可以问，不能改", help_text)
+        self.assertIn("18DBFFF1", help_text)
+        self.assertIn("CAN adapter (Peak, ZLG, …)", buf.getvalue())
+
+    def test_adapters_share_the_ask_allowlist(self):
+        self.assertIsInstance(cb.open_can_port("auto"), cb.PeakBus)
+        self.assertIsInstance(cb.open_can_port("pcan-basic"), cb.PeakBus)
+        self.assertIsInstance(cb.open_can_port("zlg"), cb.ZlgBus)
+        self.assertIsInstance(cb.open_can_port("socketcan", iface="can0"), cb.SocketCanBus)
+        with self.assertRaises(cb.Fail):
+            cb.open_can_port("nope")
+        raw = cb.socketcan_frame(0x18DBFFF1, bytes.fromhex("021003"), True)
+        ident, dlc = struct.unpack_from("=IB", raw)
+        self.assertEqual(ident, 0x18DBFFF1 | cb.CAN_EFF_FLAG)
+        self.assertEqual(dlc, 3)
+        obj = cb.zlg_frame(0x18DA10F1, bytes.fromhex("023E00"), True)
+        self.assertEqual(obj.ID, 0x18DA10F1)
+        self.assertEqual(obj.ExternFlag, 1)
+        self.assertEqual(obj.RemoteFlag, 0)
+        self.assertEqual(obj.SendType, 1)
+        self.assertEqual(obj.DataLen, 3)
+        self.assertEqual(bytes(obj.Data[:3]), bytes.fromhex("023E00"))
+        good = cb.uds_read_frames("extended")[0]
+        blocked = (
+            bytes.fromhex("022701"),
+            bytes.fromhex("021002"),
+            bytes.fromhex("032EF190"),
+            bytes.fromhex("032FF190"),
+            bytes.fromhex("023101"),
+            bytes.fromhex("023400"),
+            bytes.fromhex("0136"),
+            bytes.fromhex("0137"),
+        )
+        for port in (cb.PeakBus(), cb.ZlgBus(), cb.SocketCanBus("can0")):
+            port.transmitting = True
+            port.classic = True
+            port.bitrate = cb.DIAGNOSTIC_BITRATE
+            for data in blocked:
+                with self.assertRaises(cb.Fail) as caught:
+                    port.send(0x18DBFFF1, data, extended=True)
+                message = str(caught.exception)
+                self.assertTrue(message.startswith("This frame is not a read-only question."))
+                self.assertNotIn("可以问", message)
+            with self.assertRaises(cb.Fail) as caught:
+                port.send(*good)
+            self.assertNotIn("可以问，不能改", str(caught.exception))
+
+    def test_connect_names_dongle_and_only_asks(self):
+        self.assertIn("Peak PCAN-USB", cb.plain_adapter_name("", "", 0x0C72, 0x000C, catalog=cb._catalog(0x0C72, 0x000C)))
+        self.assertEqual(
+            cb.plain_adapter_name("", "", 0x1234, 0xABCD),
+            "unknown USB-CAN, VID:PID 1234:abcd",
+        )
+        self.assertEqual(cb.explain_failure(cb.Fail(cb.t("not_a_question"))), cb.t("plain_boundary"))
+        self.assertEqual(cb.explain_failure(cb.Fail("PCAN-Basic library not found")), cb.t("plain_driver"))
+        self.assertEqual(cb.explain_failure(cb.Fail("bitrate is 250000 bit/s")), cb.t("plain_bitrate"))
+        self.assertEqual(cb.explain_failure(cb.Fail("Network is down")), cb.t("plain_power"))
+        with tempfile.TemporaryDirectory() as root:
+            usb = os.path.join(root, "bus", "usb", "devices", "1-2")
+            os.makedirs(usb)
+            with open(os.path.join(usb, "idVendor"), "w", encoding="ascii") as handle:
+                handle.write("0c72\n")
+            with open(os.path.join(usb, "idProduct"), "w", encoding="ascii") as handle:
+                handle.write("000c\n")
+            iface = os.path.join(root, "class", "net", "can0")
+            os.makedirs(iface)
+            with open(os.path.join(iface, "type"), "w", encoding="ascii") as handle:
+                handle.write("280\n")
+            os.symlink(usb, os.path.join(iface, "device"))
+            unknown = os.path.join(root, "bus", "usb", "devices", "1-3")
+            os.makedirs(unknown)
+            iface_node = os.path.join(root, "bus", "usb", "devices", "1-3:1.0")
+            os.makedirs(iface_node)
+            with open(os.path.join(unknown, "idVendor"), "w", encoding="ascii") as handle:
+                handle.write("1234\n")
+            with open(os.path.join(unknown, "idProduct"), "w", encoding="ascii") as handle:
+                handle.write("abcd\n")
+            driver = os.path.join(root, "bus", "usb", "drivers", "gs_usb")
+            os.makedirs(driver)
+            os.symlink(driver, os.path.join(iface_node, "driver"))
+            found = cb.enumerate_adapters(root, libs={"peak": False, "zlg": False})
+            plains = [item["plain"] for item in found]
+            self.assertIn("Peak PCAN-USB", plains)
+            self.assertIn("unknown USB-CAN, VID:PID 1234:abcd", plains)
+            self.assertTrue(any(item["iface"] == "can0" and item["ready"] for item in found))
+            bare = os.path.join(root, "bus", "usb", "devices", "1-4")
+            os.makedirs(bare)
+            with open(os.path.join(bare, "idVendor"), "w", encoding="ascii") as handle:
+                handle.write("0471\n")
+            with open(os.path.join(bare, "idProduct"), "w", encoding="ascii") as handle:
+                handle.write("1200\n")
+            only = cb.enumerate_adapters(os.path.join(root, "empty") if False else root, libs={"peak": False, "zlg": False})
+            zlg = [item for item in only if item["vid"] == 0x0471]
+            self.assertEqual(zlg[0]["plain"], "ZLG USBCAN")
+            self.assertFalse(zlg[0]["ready"])
+        quiet = cb.run_connect(found=[])
+        self.assertIn(cb.t("plain_nothing"), "\n".join(quiet["lines"]))
+        self.assertEqual(quiet["asked"], [])
+        missing = cb.run_connect(found=[{"plain": "Peak PCAN-USB", "ready": False, "backend": "peak"}])
+        self.assertIn(cb.t("plain_driver"), "\n".join(missing["lines"]))
+        self.assertEqual(missing["asked"], [])
+
+        class Box:
+            def __init__(self, fail=None, heard=None):
+                self.fail = fail
+                self.heard = heard or []
+                self.sent = []
+                self.transmitting = False
+                self.classic = False
+                self.bitrate = 0
+
+            def open_transmit(self, classic=False, bitrate=500000):
+                if self.fail:
+                    raise cb.Fail(self.fail)
+                self.transmitting = True
+                self.classic = classic
+                self.bitrate = bitrate
+
+            def send(self, can_id, data, extended=False, fd=False, brs=False):
+                data = cb.guard_transmit(self, can_id, data, extended)
+                self.sent.append((can_id, bytes(data), extended))
+
+            def read_frames(self, seconds=0.25):
+                return self.heard
+
+            def close(self):
+                self.transmitting = False
+
+        box = Box(heard=[{"id": 0x18DAF110, "ext": True, "data": bytes.fromhex("0362F190000000")}])
+        report = cb.run_connect(
+            found=[{"plain": "Peak PCAN-USB", "backend": "peak", "iface": "can0", "ready": True}],
+            open_port=lambda *args, **kwargs: box,
+        )
+        self.assertTrue(report["ok"])
+        self.assertEqual(len(box.sent), 4)
+        for can_id, data, ext in box.sent:
+            self.assertEqual(can_id, 0x18DBFFF1)
+            self.assertTrue(ext)
+            self.assertTrue(cb.is_inquiry(can_id, data, ext))
+            self.assertNotIn(data[1], cb.BLOCKED_SERVICES)
+        text = "\n".join(report["lines"])
+        self.assertTrue(text.startswith("You can ask. You cannot change."))
+        self.assertIn("Peak PCAN-USB", text)
+        self.assertIn("data value", text)
+        self.assertIn("public dictionary", text)
+        slow = Box(fail="interface is 250000 bit/s")
+        denied = cb.run_connect(
+            found=[{"plain": "ZLG USBCAN", "backend": "zlg", "iface": "", "ready": True}],
+            open_port=lambda *args, **kwargs: slow,
+        )
+        self.assertFalse(denied["ok"])
+        self.assertIn(cb.t("plain_bitrate"), "\n".join(denied["lines"]))
+        self.assertEqual(slow.sent, [])
+        dead = Box(fail="Network is down")
+        powered = cb.run_connect(
+            found=[{"plain": "SocketCAN can0", "backend": "socketcan", "iface": "can0", "ready": True}],
+            open_port=lambda *args, **kwargs: dead,
+        )
+        self.assertIn(cb.t("plain_power"), "\n".join(powered["lines"]))
+        page = cb.connect_html(
+            [{"plain": "unknown USB-CAN, VID:PID 1234:abcd"}],
+            [cb.t("ask_only")],
+        )
+        self.assertIn("unknown USB-CAN, VID:PID 1234:abcd", page)
+        self.assertIn("You can ask. You cannot change.", page)
+        self.assertNotIn("可以问，不能改", page)
+        self.assertIn("do not need to know the brand", page)
+        self.assertIn("What do you want to diagnose?", page)
+        self.assertIn("Recommended bus", page)
+        self.assertIn("0x18DBFFF1", page)
+        self.assertIn("$27", page)
+        self.assertIn('type="button"', page)
+        self.assertNotIn("fetch(", page)
+        full = cb.connect_html(
+            [{"plain": "Peak PCAN-USB", "ready": True, "backend": "peak"}],
+            [cb.t("ask_only")],
+            asked=[(0x18DBFFF1, bytes.fromhex("0322F19000000000"), True)],
+            heard=[{"id": 0x18DAF110, "ext": True, "data": bytes.fromhex("0362F190000000")}],
+        )
+        self.assertIn("Peak PCAN-USB", full)
+        self.assertIn("03 22 F1 90", full)
+        self.assertIn("data value", full)
+        self.assertIn('data-goal="vin"', full)
+        self.assertIn("Asked, read only", full)
+        self.assertNotIn("可以问，不能改", full)
+        real_enum = cb.enumerate_adapters
+        cb.enumerate_adapters = lambda *args, **kwargs: []
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                self.assertEqual(cb.main(["connect"]), 0)
+            self.assertIn(cb.t("plain_nothing"), buf.getvalue())
+        finally:
+            cb.enumerate_adapters = real_enum
+
+    def test_locale_is_one_language(self):
+        site = ["en", "zh", "zh_tw", "fr", "de", "es", "it", "pt", "nl", "pl", "sv", "da", "no", "fi", "is", "tr", "ar", "he", "ja", "ko"]
+        self.assertEqual(list(cb.LANGS), site)
+        keys = set(cb.COPY["en"])
+        for code in site:
+            self.assertEqual(set(cb.COPY[code]), keys, code)
+            ask = cb.COPY[code]["ask_only"]
+            self.assertFalse("You can ask" in ask and "可以" in ask, code)
+        self.assertEqual(cb.norm_lang("en-US"), "en")
+        self.assertEqual(cb.norm_lang("zh-CN"), "zh")
+        self.assertEqual(cb.norm_lang("zh-TW"), "zh_tw")
+        self.assertEqual(cb.norm_lang("nb-NO"), "no")
+        self.assertEqual(cb.norm_lang("ja"), "ja")
+        self.assertEqual(cb.norm_lang("xx"), "")
+        self.assertEqual(cb.t("ask_only", "xx"), cb.COPY["en"]["ask_only"])
+        cb.set_lang("zh")
+        try:
+            self.assertEqual(cb.t("ask_only"), "可以问，不能改")
+            page = cb.connect_html([], [])
+            self.assertIn("可以问，不能改", page)
+            self.assertIn("要诊断什么？", page)
+            self.assertNotIn("You can ask", page)
+            self.assertNotIn("What do you want", page)
+            self.assertIn('lang="zh-CN"', page)
+            for key in ("step_want", "step_bus", "page_lead", "status_asked"):
+                self.assertNotEqual(cb.COPY["zh"][key], cb.COPY["en"][key], key)
+                self.assertNotEqual(cb.COPY["de"][key], cb.COPY["en"][key], key)
+                self.assertNotEqual(cb.COPY["ja"][key], cb.COPY["en"][key], key)
+            cb.set_lang("he")
+            self.assertIn('dir="rtl"', cb.connect_html([], []))
+        finally:
+            cb.set_lang("en")
+        old = os.environ.get("WR_LANG")
+        os.environ["WR_LANG"] = "de"
+        cb.reset_lang()
+        try:
+            self.assertEqual(cb.active_lang(), "de")
+            self.assertEqual(cb.t("ask_only"), cb.COPY["de"]["ask_only"])
+        finally:
+            if old is None:
+                os.environ.pop("WR_LANG", None)
+            else:
+                os.environ["WR_LANG"] = old
+            cb.set_lang("en")
+        raw = subprocess.check_output(
+            ["node", "-e", "var c=require('./canbench.js'); process.stdout.write(JSON.stringify({langs:c.langs, copy:c.copy}))"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        got = json.loads(raw.decode("utf-8"))
+        self.assertEqual(got["langs"], site)
+        self.assertEqual(got["copy"], cb.COPY)
 
 
 if __name__ == "__main__":

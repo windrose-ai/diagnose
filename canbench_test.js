@@ -35,10 +35,82 @@ var page = cb.plotHtml([
 ], dbc, "t");
 assert.ok(page.indexOf("<svg") >= 0);
 assert.ok(page.indexOf("#f6f5f2") >= 0);
+assert.ok(page.indexOf("You can ask. You cannot change.") >= 0);
+assert.strictEqual(page.indexOf("可以问，不能改"), -1);
+assert.strictEqual(cb.policy, "You can ask. You cannot change.");
+assert.strictEqual(cb.langs.length, 20);
+assert.strictEqual(cb.text("zh", "ask_only"), "可以问，不能改");
+assert.strictEqual(cb.text("zh-TW", "ask_only"), "可以問，不能改");
+assert.strictEqual(cb.text("nope", "ask_only"), cb.policy);
+assert.strictEqual(cb.normLang("zh-CN"), "zh");
+assert.strictEqual(cb.normLang("en_uk"), "en");
+var zhPage = cb.connectPage([], [], "zh");
+assert.ok(zhPage.indexOf("可以问，不能改") >= 0);
+assert.ok(zhPage.indexOf("要诊断什么？") >= 0);
+assert.strictEqual(zhPage.indexOf("You can ask"), -1);
+assert.strictEqual(zhPage.indexOf("What do you want"), -1);
+assert.ok(zhPage.indexOf('lang="zh-CN"') >= 0);
+assert.ok(zhPage.indexOf("0x18DBFFF1") >= 0);
+assert.ok(zhPage.indexOf('type="button"') >= 0);
+assert.ok(cb.connectPage([], [], "ar").indexOf('dir="rtl"') >= 0);
+assert.strictEqual(cb.adapterLabel, "CAN adapter (Peak, ZLG, …)");
+assert.ok(page.indexOf(cb.adapterLabel) >= 0);
 assert.ok(page.indexOf("VehicleSpeed") >= 0);
 assert.strictEqual(page.indexOf("EngineSpeed"), -1);
 assert.strictEqual(cb.isInquiry(0x7DF, [0x02, 0x01, 0x0D], false), true);
-assert.strictEqual(cb.isInquiry(0x7DF, [0x03, 0x2E, 0xF1, 0x90], false), false);
+assert.strictEqual(cb.isInquiry(0x18DBFFF1, [0x02, 0x10, 0x03, 0, 0, 0, 0, 0], true), true);
+assert.strictEqual(cb.isInquiry(0x18DBFFF1, [0x02, 0x10, 0x01, 0, 0, 0, 0, 0], true), true);
+assert.strictEqual(cb.isInquiry(0x18DA10F1, [0x02, 0x3E, 0x00, 0, 0, 0, 0, 0], true), true);
+assert.strictEqual(cb.isInquiry(0x18DBFFF1, [0x03, 0x22, 0xF1, 0x90, 0, 0, 0, 0], true), true);
+assert.strictEqual(cb.isInquiry(0x18DBFFF1, [0x03, 0x19, 0x02, 0xFF, 0, 0, 0, 0], true), true);
+assert.strictEqual(cb.isInquiry(0x7DF, [0x02, 0x10, 0x03, 0, 0, 0, 0, 0], false), false);
+assert.strictEqual(cb.isInquiry(0x18DAF110, [0x03, 0x22, 0xF1, 0x90, 0, 0, 0, 0], true), false);
+assert.strictEqual(cb.isInquiry(0x18DBFFF1, [0x02, 0x10, 0x02, 0, 0, 0, 0, 0], true), false);
+assert.strictEqual(cb.isInquiry(0x18DBFFF1, [0x02, 0x27, 0x01, 0, 0, 0, 0, 0], true), false);
+assert.strictEqual(cb.isInquiry(0x18DBFFF1, [0x02, 0x34, 0x00, 0, 0, 0, 0, 0], true), false);
+assert.strictEqual(cb.isInquiry(0x18DBFFF1, [0x02, 0x36, 0x01, 0, 0, 0, 0, 0], true), false);
+assert.strictEqual(cb.isInquiry(0x18DBFFF1, [0x01, 0x37, 0, 0, 0, 0, 0, 0], true), false);
+assert.strictEqual(cb.isInquiry(0x18DBFFF1, [0x04, 0x31, 0x01, 0x02, 0x03, 0, 0, 0], true), false);
+assert.strictEqual(cb.isInquiry(0x18DBFFF1, [0x03, 0x2F, 0xF1, 0x90, 0, 0, 0, 0], true), false);
+assert.strictEqual(cb.isInquiry(0x0CF00400, [0x03, 0x22, 0xF1, 0x90, 0, 0, 0, 0], true), false);
+assert.strictEqual(cb.isInquiry(0x18DBFFF1, [0x03, 0x2E, 0xF1, 0x90], true), false);
+var poll = cb.udsReadFrames("extended");
+assert.strictEqual(poll.length, 4);
+assert.strictEqual(poll[0].id, 0x18dbfff1);
+assert.strictEqual(poll[0].ext, true);
+poll.forEach(function (fr) { assert.strictEqual(cb.isInquiry(fr.id, fr.data, fr.ext), true); });
+var phys = cb.udsReadFrames("extended", 0x10);
+assert.strictEqual(phys[0].id, 0x18da10f1);
+assert.strictEqual(cb.udsReadFrames("extended", 0xf1), null);
+assert.strictEqual(cb.udsReadFrames("programming"), null);
+assert.strictEqual(cb.plainAdapterName({ vid: 0x0c72, pid: 0x000c }), "Peak PCAN-USB");
+assert.strictEqual(cb.plainAdapterName({ vid: 0x0471, pid: 0x1200 }), "ZLG USBCAN");
+assert.strictEqual(cb.plainAdapterName({ vid: 0x1234, pid: 0xabcd }), "unknown USB-CAN, VID:PID 1234:abcd");
+var opened = cb.connectPage(
+  [{ vid: 0x1234, pid: 0xabcd }, { vid: 0x0c72, pid: 0x000c }],
+  ["You can ask. You cannot change."]
+);
+assert.ok(opened.indexOf("unknown USB-CAN, VID:PID 1234:abcd") >= 0);
+assert.ok(opened.indexOf("Peak PCAN-USB") >= 0);
+assert.ok(opened.indexOf("You can ask. You cannot change.") >= 0);
+assert.strictEqual(opened.indexOf("可以问，不能改"), -1);
+assert.ok(opened.indexOf("do not need to know the brand") >= 0);
+assert.strictEqual(cb.connectPage([], []).indexOf("Nothing is plugged in") >= 0, true);
+var full = cb.connectPage(
+  [{ plain: "Peak PCAN-USB", ready: true }],
+  ["You can ask. You cannot change."],
+  "en",
+  [{ id: 0x18DBFFF1, ext: true, data: [0x03, 0x22, 0xF1, 0x90, 0, 0, 0, 0] }],
+  [{ id: 0x18DAF110, ext: true, data: [0x03, 0x62, 0xF1, 0x90, 0, 0, 0, 0] }]
+);
+assert.ok(full.indexOf("What do you want to diagnose?") >= 0);
+assert.ok(full.indexOf("0x18DBFFF1") >= 0);
+assert.ok(full.indexOf("03 22 F1 90") >= 0);
+assert.ok(full.indexOf("data value") >= 0);
+assert.ok(full.indexOf("wr-sec") >= 0);
+assert.ok(full.indexOf('type="button"') >= 0);
+assert.strictEqual(full.indexOf("fetch("), -1);
+assert.strictEqual(full.indexOf("可以问，不能改"), -1);
 assert.strictEqual(cb.isInquiry(0x7E0, [0x30, 0x00, 0x00], false), true);
 assert.strictEqual(cb.isInquiry(0x18FEF100, [0, 1, 2, 3, 4, 5, 6, 7], true), false);
 var req = cb.j1939Request("dm1");

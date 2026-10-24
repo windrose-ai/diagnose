@@ -2,20 +2,27 @@
 # Copyright 2026 Windrose
 # Local CAN bench for Windrose AI. Python 3.9 standard library only.
 # Plot, a DBC you choose, and J1939 stay on this computer. Nothing here is sent
-# to the assistant. send() transmits a question only. Clear, write, reset,
-# and control frames are refused. Recording stays listen-only.
+# to the assistant. send() may ask a read-only diagnostic question. Clear,
+# write, flash, security access, and control frames are refused.
+# Recording stays listen-only. The ask path is a CAN adapter (Peak, ZLG, …):
+# PCAN-Basic, ZLG ControlCAN, or SocketCAN, classic ~500 kbit/s.
 # PCAN-USB FD does not speak CAN XL.
-# CANBENCH_REV = "2026-10-05.1"
+# CANBENCH_REV = "2026-10-24.6"
 
 from __future__ import annotations
 
 import ctypes
 import html
+import json
 import os
 import re
+import socket
+import struct
 import sys
+import time
 
-CANBENCH_REV = "2026-10-05.1"
+CANBENCH_REV = "2026-10-24.6"
+ADAPTER_LABEL = "CAN adapter (Peak, ZLG, …)"
 CH1 = 0x51  # PCAN_USBBUS1
 LISTEN_ONLY = 0x08
 OK = 0x00000
@@ -67,16 +74,116 @@ TOOL_SA = 0xFE
 MULTI_PG = 0x2500
 FD_TP_CM = 0x4D00
 FD_TP_DT = 0x4E00
-BUS_NOTE = (
-    "Asking only. Nothing on the truck is changed. "
-    "CAN XL is not available on PCAN-USB FD."
-)
-# OBD/UDS services that read. 0x04 clears faults. 0x08, 0x10, 0x11, 0x14,
-# 0x27, 0x2E, 0x2F, 0x31 and the download services change the truck.
-READ_SERVICES = frozenset((0x01, 0x02, 0x03, 0x05, 0x06, 0x07, 0x09, 0x0A, 0x19, 0x22))
-NOT_A_QUESTION = "This frame is not a question. Clear, reset, write, and control are not sent."
+# Diagnostic interface only: OBD pins 6 and 14, classic CAN, via TGW / GWCANFD9.
+# Not the powertrain backbone.
+DIAGNOSTIC_BITRATE = 500000
+# WH13 / E700 UDS is 29-bit. Functional broadcast, tester source 0xF1.
+# Physical request is 0x18DAxxF1. Response 0x18DAF1xx is never transmitted.
+WH13_FUNCTIONAL = 0x18DBFFF1
+# J1979 legacy only. UDS asks are not sent on these ids.
+J1979_FUNCTIONAL = 0x7DF
+J1979_FUNCTIONAL_EXT = 0x18DB33F1
+# One language at a time, same codes as windrose.ai/translations.js.
+# English is always the fallback. WR_LANG or --lang picks the other catalog.
+def _load_i18n():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "canbench_i18n.json")
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    return tuple(data["langs"]), data["copy"]
 
 
+LANGS, COPY = _load_i18n()
+_LANG_ALIAS = {
+    "en_world": "en", "en_us": "en", "en_uk": "en", "en_au": "en",
+    "zh_cn": "zh", "zh_hans": "zh", "zh_hant": "zh_tw",
+    "nb": "no", "nn": "no", "iw": "he",
+}
+_LANG = None
+
+
+def norm_lang(raw):
+    """Fold a language tag the way the website does. Empty string means unknown."""
+    text = str(raw or "").strip().lower().replace("-", "_")
+    if not text:
+        return ""
+    text = _LANG_ALIAS.get(text, text)
+    if text in LANGS:
+        return text
+    two = _LANG_ALIAS.get(text.split("_")[0], text.split("_")[0])
+    return two if two in LANGS else ""
+
+
+def set_lang(lang):
+    """Pin the language for this process. Unknown tags become English."""
+    global _LANG
+    _LANG = norm_lang(lang) or "en"
+
+
+def reset_lang():
+    """Follow WR_LANG again, then English. This is what a fresh process does."""
+    global _LANG
+    _LANG = None
+
+
+def active_lang():
+    if _LANG is not None:
+        return _LANG
+    return norm_lang(os.environ.get("WR_LANG") or "") or "en"
+
+
+def t(key, lang=None):
+    """One string from the active catalog. Missing keys and languages use English."""
+    code = norm_lang(lang) if lang is not None else active_lang()
+    pack = COPY.get(code or "en") or COPY["en"]
+    if key not in pack:
+        pack = COPY["en"]
+    return pack[key]
+
+
+def html_locale():
+    """html lang tag and dir. Arabic and Hebrew are right to left, as on the site."""
+    code = active_lang()
+    if code == "zh":
+        tag = "zh-CN"
+    elif code == "zh_tw":
+        tag = "zh-TW"
+    else:
+        tag = code
+    return tag, ("rtl" if code in ("ar", "he") else "ltr")
+# Transmit allowlist. A service id that is not listed is refused.
+# Keep these sets in sync with canbench.js.
+# $10 is listed, and only default (0x01) and extended (0x03) sub-functions pass.
+# Programming session (0x02) is the flash entry and is refused below.
+UDS_ASK_SERVICES = frozenset((0x10, 0x19, 0x22, 0x3E))
+# J1979 reads already supported, on 0x7DF / 0x7E0-0x7E7 / 0x18DB33F1 only.
+# Mode 04 (clear) and mode 08 (control) are not in this set.
+OBD_READ_SERVICES = frozenset((0x01, 0x02, 0x03, 0x05, 0x06, 0x07, 0x09, 0x0A))
+# Hard block. Checked before the allowlist. No seed-key, flash, write, or control.
+BLOCKED_SERVICES = frozenset((
+    0x04,  # OBD clear DTCs
+    0x08,  # OBD control of an onboard system
+    0x11,  # ECUReset
+    0x14,  # ClearDiagnosticInformation
+    0x27,  # SecurityAccess
+    0x28,  # CommunicationControl
+    0x29,  # Authentication
+    0x2A,  # ReadDataByPeriodicIdentifier (arms periodic transmit)
+    0x2C,  # DynamicallyDefineDataIdentifier
+    0x2E,  # WriteDataByIdentifier
+    0x2F,  # InputOutputControlByIdentifier
+    0x31,  # RoutineControl
+    0x34,  # RequestDownload
+    0x35,  # RequestUpload
+    0x36,  # TransferData
+    0x37,  # RequestTransferExit
+    0x38,  # RequestFileTransfer
+    0x3D,  # WriteMemoryByAddress
+    0x83,  # AccessTimingParameter
+    0x84,  # SecuredDataTransmission
+    0x85,  # ControlDTCSetting
+    0x86,  # ResponseOnEvent
+    0x87,  # LinkControl
+))
 class Fail(Exception):
     pass
 
@@ -99,27 +206,91 @@ def is_j1939_read_request(can_id, data, extended=False):
     return all(b in (0xFF, 0x00) for b in data[3:])
 
 
+def _id_ext(can_id, extended=False):
+    n = can_id & 0x1FFFFFFF
+    return n, bool(extended or n > 0x7FF)
+
+
+def is_wh13_request(can_id, extended=False):
+    """WH13 / E700 tester request. Functional 0x18DBFFF1 or physical 0x18DAxxF1.
+
+    Response ids 0x18DAF1xx are not requests and are never transmitted.
+    """
+    n, extended = _id_ext(can_id, extended)
+    if not extended:
+        return False
+    if n == WH13_FUNCTIONAL:
+        return True
+    return (n & 0xFFFF00FF) == 0x18DA00F1 and ((n >> 8) & 0xFF) != 0xF1
+
+
+def is_j1979_request(can_id, extended=False):
+    """Passenger-car / legislated OBD request ids. Not the WH13 UDS address."""
+    n, extended = _id_ext(can_id, extended)
+    if not extended:
+        return n == J1979_FUNCTIONAL or 0x7E0 <= n <= 0x7E7
+    return n == J1979_FUNCTIONAL_EXT
+
+
+def is_diagnostic_address(can_id, extended=False):
+    """Tester request ids on the diagnostic interface. Not a powertrain backbone id."""
+    return is_wh13_request(can_id, extended) or is_j1979_request(can_id, extended)
+
+
+def service_is_read(payload):
+    """True only for an allowlisted read. payload starts with the service id.
+
+    $10 DiagnosticSessionControl passes for default (0x01) and extended (0x03)
+    only, including the suppress-response bit. Programming session (0x02) does
+    not. $3E TesterPresent passes for sub-function 0x00 only. $22 and $19 are
+    reads. Everything in BLOCKED_SERVICES is refused, including flash,
+    WriteDataByIdentifier, IO control, routine control, and SecurityAccess.
+    """
+    if not payload:
+        return False
+    sid = payload[0]
+    allowed = sid in UDS_ASK_SERVICES or sid in OBD_READ_SERVICES
+    if sid in BLOCKED_SERVICES or not allowed:
+        return False
+    if sid == 0x10:
+        if len(payload) != 2:
+            return False
+        return (payload[1] & 0x7F) in (0x01, 0x03)
+    if sid == 0x3E:
+        if len(payload) != 2:
+            return False
+        return (payload[1] & 0x7F) == 0x00
+    if sid == 0x22:
+        return len(payload) >= 3 and ((len(payload) - 1) % 2) == 0
+    if sid == 0x19:
+        return len(payload) >= 2 and (payload[1] & 0x7F) != 0
+    return sid in OBD_READ_SERVICES
+
+
 def is_inquiry(can_id, data, extended=False):
-    """True for a diagnostic question or the flow-control that finishes a read."""
+    """True for a diagnostic question or the flow-control that finishes a read.
+
+    UDS asks ($10, $19, $22, $3E) are WH13 29-bit only. J1979 reads stay on
+    0x7DF, 0x7E0-0x7E7, and 0x18DB33F1.
+    """
     data = bytes(data)
     if is_j1939_read_request(can_id, data, extended):
         return True
-    n = can_id & 0x1FFFFFFF
-    extended = extended or n > 0x7FF
-    if not extended:
-        ok = n == 0x7DF or 0x7E0 <= n <= 0x7E7
-    else:
-        ok = n == 0x18DB33F1 or (
-            (n & 0xFFFF00FF) == 0x18DA00F1 and ((n >> 8) & 0xFF) != 0xF1
-        )
-    if not ok or len(data) < 2:
+    if len(data) < 2:
         return False
     pci = data[0]
     if pci == 0x30:
+        if not is_diagnostic_address(can_id, extended):
+            return False
         return len(data) >= 3 and data[1] == 0x00 and data[2] == 0x00 and not any(data[3:])
     if pci < 1 or pci > 7 or len(data) < 1 + pci:
         return False
-    return data[1] in READ_SERVICES
+    payload = data[1:1 + pci]
+    if not service_is_read(payload):
+        return False
+    if payload[0] in UDS_ASK_SERVICES:
+        return is_wh13_request(can_id, extended)
+    return is_j1979_request(can_id, extended)
 
 
 def j1939_request_pgn(name):
@@ -148,8 +319,15 @@ def j1939_request_frame(name):
     data = bytes((pgn & 0xFF, (pgn >> 8) & 0xFF, (pgn >> 16) & 0xFF)) + b"\xff" * 5
     frame = (0x18EAFFFE, data, True)
     if not is_j1939_read_request(frame[0], frame[1], frame[2]):
-        raise Fail(NOT_A_QUESTION)
+        raise Fail(t("not_a_question"))
     return frame
+
+
+def _pad8(body):
+    body = bytes(body)
+    if len(body) > 8:
+        raise Fail("A read request has to fit in one classic CAN frame.")
+    return body + bytes(8 - len(body))
 
 
 def standard_questions():
@@ -159,10 +337,73 @@ def standard_questions():
     bodies.append(bytes((0x02, 0x09, 0x02)))
     frames = []
     for body in bodies:
-        pad = body + bytes(8 - len(body))
-        frames.append((0x7DF, pad, False))
-        frames.append((0x18DB33F1, pad, True))
+        pad = _pad8(body)
+        frames.append((J1979_FUNCTIONAL, pad, False))
+        frames.append((J1979_FUNCTIONAL_EXT, pad, True))
     return frames
+
+
+def wh13_request_id(target=None):
+    """Functional 0x18DBFFF1, or physical 0x18DAxxF1 when target is an ECU byte."""
+    if target is None:
+        return WH13_FUNCTIONAL
+    if isinstance(target, str):
+        target = _parse_target(target)
+    if not isinstance(target, int) or isinstance(target, bool) or not 0 <= target <= 0xFF or target == 0xF1:
+        raise Fail("UDS physical target is one byte other than the tester address 0xF1.")
+    return 0x18DA00F1 | (target << 8)
+
+
+def _parse_target(text):
+    text = str(text).strip().lower()
+    if text.startswith("0x"):
+        text = text[2:]
+    try:
+        target = int(text, 16)
+    except ValueError:
+        raise Fail("UDS --target is one hex byte, for physical id 0x18DAxxF1.")
+    if not 0 <= target <= 0xFF or target == 0xF1:
+        raise Fail("UDS --target is one byte other than the tester address 0xF1.")
+    return target
+
+
+def uds_read_frames(session="extended", target=None):
+    """One read-only UDS poll on the WH13 29-bit diagnostic id.
+
+    Default id is functional 0x18DBFFF1. Pass target to use physical
+    0x18DAxxF1. Order: session (default or extended), TesterPresent, VIN,
+    then stored DTCs. No programming session, no write, no security access.
+    """
+    if session == "default":
+        sub = 0x01
+    elif session == "extended":
+        sub = 0x03
+    else:
+        raise Fail("UDS session must be default or extended. Programming is not a read.")
+    can_id = wh13_request_id(target)
+    bodies = [
+        bytes((0x02, 0x10, sub)),
+        bytes((0x02, 0x3E, 0x00)),
+        bytes((0x03, 0x22, 0xF1, 0x90)),
+        bytes((0x03, 0x19, 0x02, 0xFF)),
+    ]
+    frames = []
+    for body in bodies:
+        frame = (can_id, _pad8(body), True)
+        if not is_inquiry(frame[0], frame[1], frame[2]):
+            raise Fail(t("not_a_question"))
+        frames.append(frame)
+    return frames
+
+
+def _uds_ask_frame(data):
+    data = bytes(data)
+    if len(data) < 2:
+        return False
+    pci = data[0]
+    if pci < 1 or pci > 7 or len(data) < 1 + pci:
+        return False
+    return data[1] in UDS_ASK_SERVICES
 
 
 def pgn_parts(can_id):
@@ -446,18 +687,24 @@ def _changed_series(rows):
 def plot_html(frames, dbc, title="CAN plot"):
     series = _changed_series(decode(frames, dbc))
     parts = [
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>",
+        "<!DOCTYPE html><html lang=\"%s\" dir=\"%s\"><head><meta charset=\"utf-8\"><title>" % html_locale(),
         html.escape(title),
         "</title><style>",
         "body{background:#f6f5f2;color:#1c1c1c;font:14px -apple-system,BlinkMacSystemFont,sans-serif;margin:24px}",
         "svg{background:#fff;border:1px solid #ddd;display:block;margin:8px 0 20px}",
+        "p.policy{font-weight:600;color:#1c1c1c}",
         "p.note{color:#555}",
         "</style></head><body><h1>",
         html.escape(title),
-        "</h1><p class=\"note\">Local file. It is not sent to the assistant.</p>",
+        "</h1><p class=\"policy\">",
+        html.escape(t("ask_only")),
+        "</p>",
+        "<p class=\"note\">",
+        html.escape(t("plot_note")),
+        "</p>",
     ]
     if not series:
-        parts.append("<p>No signal in this recording changed value.</p>")
+        parts.append("<p>%s</p>" % html.escape(t("plot_empty")))
     width, height, pad = 720, 140, 28
     for (message, signal, unit), pts in series:
         t0 = pts[0]["t"]
@@ -694,6 +941,10 @@ class Msg(ctypes.Structure):
     _fields_ = [("ID", ctypes.c_uint32), ("MSGTYPE", ctypes.c_uint8), ("LEN", ctypes.c_uint8), ("DATA", ctypes.c_uint8 * 8)]
 
 
+class Stamp(ctypes.Structure):
+    _fields_ = [("millis", ctypes.c_uint32), ("millis_overflow", ctypes.c_uint16), ("micros", ctypes.c_uint16)]
+
+
 class MsgFD(ctypes.Structure):
     _fields_ = [("ID", ctypes.c_uint32), ("MSGTYPE", ctypes.c_uint8), ("DLC", ctypes.c_uint8), ("DATA", ctypes.c_uint8 * 64)]
 
@@ -709,6 +960,9 @@ def load_peak(path):
     lib.CAN_GetValue.argtypes = [ctypes.c_uint16, ctypes.c_uint8, ctypes.c_void_p, ctypes.c_uint32]
     for name in ("CAN_Initialize", "CAN_InitializeFD", "CAN_Uninitialize", "CAN_Write", "CAN_WriteFD", "CAN_SetValue", "CAN_GetValue"):
         getattr(lib, name).restype = ctypes.c_uint32
+    if hasattr(lib, "CAN_Read"):
+        lib.CAN_Read.argtypes = [ctypes.c_uint16, ctypes.POINTER(Msg), ctypes.POINTER(Stamp)]
+        lib.CAN_Read.restype = ctypes.c_uint32
     return lib
 
 
@@ -732,14 +986,35 @@ def default_lib():
     return ""
 
 
+def guard_transmit(bus, can_id, data, extended):
+    """Shared ask-only check for every CAN adapter. Called before any write."""
+    if not bus.transmitting:
+        raise Fail("Call open_transmit() before send().")
+    data = bytes(data)
+    if not is_inquiry(can_id, data, extended):
+        raise Fail(t("not_a_question"))
+    if _uds_ask_frame(data) and (not bus.classic or bus.bitrate != DIAGNOSTIC_BITRATE):
+        raise Fail(t("uds_bus"))
+    return data
+
+
 class PeakBus:
-    """PEAK adapter. open_listen records. open_transmit opens the channel for send."""
+    """PCAN-Basic adapter (Peak and other PCAN-Basic devices).
+
+    open_listen records and does not transmit. open_transmit asks on the
+    diagnostic interface. send() still refuses any frame that is not an
+    allowlisted read.
+    """
+
+    name = "peak"
 
     def __init__(self, lib=None, lib_path=""):
         self.lib = lib
         self.lib_path = lib_path
         self.listening = False
         self.transmitting = False
+        self.classic = False
+        self.bitrate = 0
 
     def arm(self, word=""):
         """Kept so older callers can run. Transmit no longer waits on this word."""
@@ -756,7 +1031,10 @@ class PeakBus:
             return
         path = self.lib_path or default_lib()
         if not path:
-            raise Fail("PEAK library not found. Set WR_PCBUSB or install PCBUSB / PCAN-Basic.")
+            raise Fail(
+                "%s: PCAN-Basic library not found. Set WR_PCBUSB, or use --adapter zlg "
+                "or --adapter socketcan --iface can0." % ADAPTER_LABEL
+            )
         self.lib = load_peak(path)
 
     def _open(self, classic, bitrate, listen):
@@ -772,7 +1050,10 @@ class PeakBus:
         else:
             st = self.lib.CAN_InitializeFD(CH1, WINDROSE_FD)
         if st != OK:
-            raise Fail("Could not open the PEAK adapter (0x%X). Close PCAN-View if it is open." % st)
+            raise Fail(
+                "%s: could not open PCAN-Basic (0x%X). Close PCAN-View if it is open."
+                % (ADAPTER_LABEL, st)
+            )
         if listen:
             got = ctypes.c_uint32(0)
             if self.lib.CAN_GetValue(CH1, LISTEN_ONLY, ctypes.byref(got), 4) != OK or got.value != 1:
@@ -780,13 +1061,11 @@ class PeakBus:
                 raise Fail("The adapter did not confirm listen-only. Nothing was opened for transmit.")
         self.listening = listen
         self.transmitting = not listen
+        self.classic = bool(classic)
+        self.bitrate = bitrate
 
     def send(self, can_id, data, extended=False, fd=False, brs=False):
-        if not self.transmitting:
-            raise Fail("Call open_transmit() before send().")
-        data = bytes(data)
-        if not is_inquiry(can_id, data, extended):
-            raise Fail(NOT_A_QUESTION)
+        data = guard_transmit(self, can_id, data, extended)
         self._ensure_lib()
         if fd or len(data) > 8:
             msg = MsgFD()
@@ -807,11 +1086,985 @@ class PeakBus:
         if st != OK:
             raise Fail("CAN_Write failed (0x%X)." % st)
 
+    def read_frames(self, seconds=0.25):
+        """Drain frames already on the adapter. Empty means the bus was quiet."""
+        if self.lib is None or not hasattr(self.lib, "CAN_Read"):
+            return []
+        end = time.monotonic() + seconds
+        out = []
+        while time.monotonic() < end and len(out) < 80:
+            msg = Msg()
+            stamp = Stamp()
+            st = self.lib.CAN_Read(CH1, ctypes.byref(msg), ctypes.byref(stamp))
+            if st == 0x00020:
+                time.sleep(0.02)
+                continue
+            if st != OK:
+                break
+            out.append({
+                "id": int(msg.ID) & 0x1FFFFFFF,
+                "ext": bool(msg.MSGTYPE & T_EXT),
+                "data": bytes(bytearray(msg.DATA[:msg.LEN])),
+            })
+        return out
+
     def close(self):
         if self.lib is not None and (self.listening or self.transmitting):
             self.lib.CAN_Uninitialize(CH1)
         self.listening = False
         self.transmitting = False
+
+
+# Classic SJA1000 timings used by ZLG ControlCAN. 500 kbit/s is 0x00, 0x1C.
+ZLG_TIMING = {1000000: (0x00, 0x14), 500000: (0x00, 0x1C), 250000: (0x01, 0x1C), 125000: (0x03, 0x1C)}
+CAN_EFF_FLAG = 0x80000000
+
+
+class VciInit(ctypes.Structure):
+    _fields_ = [
+        ("AccCode", ctypes.c_uint32),
+        ("AccMask", ctypes.c_uint32),
+        ("Reserved", ctypes.c_uint32),
+        ("Filter", ctypes.c_uint8),
+        ("Timing0", ctypes.c_uint8),
+        ("Timing1", ctypes.c_uint8),
+        ("Mode", ctypes.c_uint8),
+    ]
+
+
+class VciCanObj(ctypes.Structure):
+    _fields_ = [
+        ("ID", ctypes.c_uint32),
+        ("TimeStamp", ctypes.c_uint32),
+        ("TimeFlag", ctypes.c_uint8),
+        ("SendType", ctypes.c_uint8),
+        ("RemoteFlag", ctypes.c_uint8),
+        ("ExternFlag", ctypes.c_uint8),
+        ("DataLen", ctypes.c_uint8),
+        ("Data", ctypes.c_uint8 * 8),
+        ("Reserved", ctypes.c_uint8 * 3),
+    ]
+
+
+def default_zlg_lib():
+    for key in ("WR_ZLG_LIB", "ZLG_LIB"):
+        env = os.environ.get(key) or ""
+        if env and os.path.isfile(env):
+            return env
+    names = [
+        os.path.expanduser("~/.windrose/zlg/libcontrolcan.so"),
+        "/usr/lib/libcontrolcan.so",
+        "/usr/local/lib/libcontrolcan.so",
+        "/opt/zlg/libcontrolcan.so",
+        r"C:\Windows\System32\ControlCAN.dll",
+    ]
+    for base in (os.environ.get("ProgramFiles", ""), os.environ.get("ProgramFiles(x86)", "")):
+        if base:
+            names.append(os.path.join(base, "ZLG", "ControlCAN.dll"))
+    for path in names:
+        if path and os.path.isfile(path):
+            return path
+    return ""
+
+
+def load_zlg(path):
+    lib = ctypes.WinDLL(path) if os.name == "nt" else ctypes.CDLL(path)
+    u32 = ctypes.c_uint32
+    lib.VCI_OpenDevice.argtypes = [u32, u32, u32]
+    lib.VCI_CloseDevice.argtypes = [u32, u32]
+    lib.VCI_InitCAN.argtypes = [u32, u32, u32, ctypes.POINTER(VciInit)]
+    lib.VCI_StartCAN.argtypes = [u32, u32, u32]
+    lib.VCI_Transmit.argtypes = [u32, u32, u32, ctypes.POINTER(VciCanObj), u32]
+    for name in ("VCI_OpenDevice", "VCI_CloseDevice", "VCI_InitCAN", "VCI_StartCAN", "VCI_Transmit"):
+        getattr(lib, name).restype = u32
+    if hasattr(lib, "VCI_Receive"):
+        lib.VCI_Receive.argtypes = [u32, u32, u32, ctypes.POINTER(VciCanObj), u32, ctypes.c_int]
+        lib.VCI_Receive.restype = u32
+    return lib
+
+
+def zlg_frame(can_id, data, extended):
+    """One classic ControlCAN data frame. SendType 1 sends it once."""
+    data = bytes(data)
+    if len(data) > 8:
+        raise Fail("%s: ZLG ask is Classic CAN, 8 bytes." % ADAPTER_LABEL)
+    obj = VciCanObj()
+    obj.ID = can_id & (0x1FFFFFFF if extended else 0x7FF)
+    obj.SendType = 1
+    obj.RemoteFlag = 0
+    obj.ExternFlag = 1 if extended else 0
+    obj.DataLen = len(data)
+    for i, b in enumerate(data):
+        obj.Data[i] = b
+    return obj
+
+
+class ZlgBus:
+    """ZLG ControlCAN (USBCAN and the same vendor USB-CAN API).
+
+    send() uses the same ask-only guard as Peak. Device type 4 is USBCAN2;
+    pass --dev-type for another ZLG model.
+    """
+
+    name = "zlg"
+
+    def __init__(self, lib=None, lib_path="", dev_type=4, dev_index=0, channel=0):
+        self.lib = lib
+        self.lib_path = lib_path
+        self.dev_type = int(dev_type)
+        self.dev_index = int(dev_index)
+        self.channel = int(channel)
+        self.opened = False
+        self.listening = False
+        self.transmitting = False
+        self.classic = False
+        self.bitrate = 0
+
+    def open_listen(self, classic=False, bitrate=500000):
+        self._open(classic, bitrate, listen=True)
+
+    def open_transmit(self, classic=False, bitrate=500000):
+        self._open(classic, bitrate, listen=False)
+
+    def _ensure_lib(self):
+        if self.lib is not None:
+            return
+        path = self.lib_path or default_zlg_lib()
+        if not path:
+            raise Fail(
+                "%s: ZLG ControlCAN library not found. Set WR_ZLG_LIB, or use "
+                "--adapter peak or --adapter socketcan --iface can0." % ADAPTER_LABEL
+            )
+        self.lib = load_zlg(path)
+
+    def _open(self, classic, bitrate, listen):
+        if not classic:
+            raise Fail("%s: ZLG ask is Classic CAN. Use send --uds or pass --classic." % ADAPTER_LABEL)
+        if bitrate not in ZLG_TIMING:
+            raise Fail("bitrate must be 1000000, 500000, 250000 or 125000")
+        self._ensure_lib()
+        if self.lib.VCI_OpenDevice(self.dev_type, self.dev_index, 0) != 1:
+            raise Fail("%s: ZLG OpenDevice failed. Check the USB-CAN box." % ADAPTER_LABEL)
+        self.opened = True
+        timing = ZLG_TIMING[bitrate]
+        cfg = VciInit()
+        cfg.AccCode = 0
+        cfg.AccMask = 0xFFFFFFFF
+        cfg.Filter = 1
+        cfg.Timing0 = timing[0]
+        cfg.Timing1 = timing[1]
+        cfg.Mode = 1 if listen else 0
+        if self.lib.VCI_InitCAN(self.dev_type, self.dev_index, self.channel, ctypes.byref(cfg)) != 1:
+            self.close()
+            raise Fail("%s: ZLG InitCAN failed." % ADAPTER_LABEL)
+        if self.lib.VCI_StartCAN(self.dev_type, self.dev_index, self.channel) != 1:
+            self.close()
+            raise Fail("%s: ZLG StartCAN failed." % ADAPTER_LABEL)
+        self.listening = listen
+        self.transmitting = not listen
+        self.classic = True
+        self.bitrate = bitrate
+
+    def send(self, can_id, data, extended=False, fd=False, brs=False):
+        data = guard_transmit(self, can_id, data, extended)
+        if fd or len(data) > 8:
+            raise Fail("%s: ZLG ask is Classic CAN, 8 bytes." % ADAPTER_LABEL)
+        if self.lib is None or not self.opened:
+            raise Fail("%s is not open." % ADAPTER_LABEL)
+        obj = zlg_frame(can_id, data, extended)
+        sent = self.lib.VCI_Transmit(self.dev_type, self.dev_index, self.channel, ctypes.byref(obj), 1)
+        if sent != 1:
+            raise Fail("%s: ZLG Transmit failed." % ADAPTER_LABEL)
+
+    def read_frames(self, seconds=0.25):
+        if self.lib is None or not self.opened or not hasattr(self.lib, "VCI_Receive"):
+            return []
+        arr = (VciCanObj * 40)()
+        wait = max(1, min(200, int(seconds * 1000)))
+        got = int(self.lib.VCI_Receive(self.dev_type, self.dev_index, self.channel, arr, 40, wait))
+        out = []
+        for i in range(max(0, min(got, 40))):
+            obj = arr[i]
+            out.append({
+                "id": int(obj.ID) & 0x1FFFFFFF,
+                "ext": bool(obj.ExternFlag),
+                "data": bytes(bytearray(obj.Data[:obj.DataLen])),
+            })
+        return out
+
+    def close(self):
+        if self.lib is not None and self.opened:
+            self.lib.VCI_CloseDevice(self.dev_type, self.dev_index)
+        self.opened = False
+        self.listening = False
+        self.transmitting = False
+
+
+def socketcan_frame(can_id, data, extended):
+    """Linux can_frame. The extended bit is CAN_EFF_FLAG, not part of the id."""
+    data = bytes(data)
+    if len(data) > 8:
+        raise Fail("%s: SocketCAN ask is Classic CAN, 8 bytes." % ADAPTER_LABEL)
+    ident = can_id & (0x1FFFFFFF if extended else 0x7FF)
+    if extended:
+        ident |= CAN_EFF_FLAG
+    return struct.pack("=IB3x8s", ident, len(data), data.ljust(8, b"\x00"))
+
+
+def _socketcan_bitrate(iface):
+    try:
+        with open("/sys/class/net/%s/can_bittiming/bitrate" % iface, encoding="ascii") as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _socketcan_present(iface):
+    try:
+        with open("/sys/class/net/%s/type" % iface, encoding="ascii") as handle:
+            return int(handle.read().strip()) == 280
+    except (OSError, ValueError):
+        return False
+
+
+class SocketCanBus:
+    """SocketCAN. Covers USB-CAN devices the OS exposes as a can interface.
+
+    That includes Peak and ZLG kernel drivers, and other vendor USB-CAN boxes.
+    The interface must already be up. UDS still requires classic 500 kbit/s.
+    """
+
+    name = "socketcan"
+
+    def __init__(self, iface="can0"):
+        self.iface = iface or "can0"
+        self.sock = None
+        self.listening = False
+        self.transmitting = False
+        self.classic = False
+        self.bitrate = 0
+
+    def open_listen(self, classic=False, bitrate=500000):
+        self._open(classic, bitrate, listen=True)
+
+    def open_transmit(self, classic=False, bitrate=500000):
+        self._open(classic, bitrate, listen=False)
+
+    def _open(self, classic, bitrate, listen):
+        if not hasattr(socket, "PF_CAN") or not hasattr(socket, "CAN_RAW"):
+            raise Fail("%s: SocketCAN is not on this system. Use --adapter peak or --adapter zlg." % ADAPTER_LABEL)
+        if bitrate not in BTR:
+            raise Fail("bitrate must be 1000000, 500000, 250000 or 125000")
+        actual = _socketcan_bitrate(self.iface)
+        if actual is not None and actual != bitrate:
+            raise Fail(
+                "%s: SocketCAN %s is %d bit/s, not %d."
+                % (ADAPTER_LABEL, self.iface, actual, bitrate)
+            )
+        try:
+            sock = socket.socket(socket.PF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+            sock.bind((self.iface,))
+        except OSError as exc:
+            raise Fail(
+                "%s: SocketCAN %s is not open (%s)."
+                % (ADAPTER_LABEL, self.iface, getattr(exc, "strerror", None) or exc)
+            )
+        self.sock = sock
+        self.listening = listen
+        self.transmitting = not listen
+        self.classic = bool(classic)
+        self.bitrate = bitrate
+
+    def send(self, can_id, data, extended=False, fd=False, brs=False):
+        data = guard_transmit(self, can_id, data, extended)
+        if fd or len(data) > 8:
+            raise Fail("%s: SocketCAN ask is Classic CAN, 8 bytes." % ADAPTER_LABEL)
+        if self.sock is None:
+            raise Fail("%s is not open." % ADAPTER_LABEL)
+        try:
+            self.sock.send(socketcan_frame(can_id, data, extended))
+        except OSError as exc:
+            raise Fail("%s: SocketCAN send failed (%s)." % (ADAPTER_LABEL, getattr(exc, "strerror", None) or exc))
+
+    def read_frames(self, seconds=0.25):
+        if self.sock is None:
+            return []
+        self.sock.settimeout(seconds)
+        out = []
+        end = time.monotonic() + seconds
+        while time.monotonic() < end and len(out) < 80:
+            try:
+                raw = self.sock.recv(16)
+            except (TimeoutError, socket.timeout, OSError):
+                break
+            if len(raw) < 16:
+                continue
+            ident, dlc = struct.unpack_from("=IB", raw)
+            ext = bool(ident & CAN_EFF_FLAG)
+            data = raw[8:8 + min(dlc, 8)]
+            out.append({"id": ident & 0x1FFFFFFF, "ext": ext, "data": data})
+        return out
+
+    def close(self):
+        sock = self.sock
+        self.sock = None
+        self.listening = False
+        self.transmitting = False
+        if sock is not None:
+            sock.close()
+
+
+ADAPTER_ALIASES = {
+    "peak": "peak",
+    "pcan": "peak",
+    "pcan-basic": "peak",
+    "pcanbasic": "peak",
+    "zlg": "zlg",
+    "controlcan": "zlg",
+    "socketcan": "socketcan",
+    "socket-can": "socketcan",
+}
+
+
+def resolve_adapter(adapter, iface=""):
+    """auto picks an explicit env, then a library that is installed, else Peak."""
+    kind = (adapter or "auto").strip().lower()
+    if kind != "auto":
+        if kind not in ADAPTER_ALIASES:
+            raise Fail("%s: unknown adapter %r. Use peak, zlg, or socketcan." % (ADAPTER_LABEL, adapter))
+        return ADAPTER_ALIASES[kind]
+    env = (os.environ.get("WR_CAN_ADAPTER") or "").strip().lower()
+    if env:
+        if env not in ADAPTER_ALIASES:
+            raise Fail("%s: unknown adapter %r. Use peak, zlg, or socketcan." % (ADAPTER_LABEL, env))
+        return ADAPTER_ALIASES[env]
+    if iface or os.environ.get("WR_CAN_IFACE"):
+        return "socketcan"
+    if default_lib():
+        return "peak"
+    if default_zlg_lib():
+        return "zlg"
+    if _socketcan_present(iface or os.environ.get("WR_CAN_IFACE") or "can0"):
+        return "socketcan"
+    return "peak"
+
+
+def open_can_port(adapter="auto", lib_path="", iface="", dev_type=4, dev_index=0, channel=0):
+    kind = resolve_adapter(adapter, iface)
+    if kind == "peak":
+        return PeakBus(lib_path=lib_path)
+    if kind == "zlg":
+        return ZlgBus(lib_path=lib_path, dev_type=dev_type, dev_index=dev_index, channel=channel)
+    return SocketCanBus(iface or os.environ.get("WR_CAN_IFACE") or "can0")
+
+
+# Public names only. No vehicle database. VID:PID values are the ones the
+# vendors and the Linux CAN drivers publish.
+KNOWN_USB_CAN = {
+    (0x0C72, 0x000C): ("Peak PCAN-USB", "peak"),
+    (0x0C72, 0x000D): ("Peak PCAN-USB Pro", "peak"),
+    (0x0C72, 0x0011): ("Peak PCAN-USB FD", "peak"),
+    (0x0C72, 0x0012): ("Peak PCAN-USB Pro FD", "peak"),
+    (0x0C72, 0x0013): ("Peak PCAN-USB Chip", "peak"),
+    (0x0C72, 0x0014): ("Peak PCAN-USB X6", "peak"),
+    (0x0471, 0x1200): ("ZLG USBCAN", "zlg"),
+    (0x1D50, 0x606F): ("candleLight USB-CAN", "socketcan"),
+}
+# Response names are ISO 14229, one language at a time. Keys: uds_50, uds_59, uds_62, uds_7e, uds_7f.
+_UDS_NAME = {0x50: "uds_50", 0x59: "uds_59", 0x62: "uds_62", 0x7E: "uds_7e", 0x7F: "uds_7f"}
+
+
+def _read_text(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def _hex_id(text):
+    try:
+        return int(text, 16)
+    except (TypeError, ValueError):
+        return None
+
+
+def plain_adapter_name(manufacturer, product, vid, pid, iface="", catalog=None):
+    """Vendor and product when we know them, otherwise unknown USB-CAN, VID:PID."""
+    if catalog:
+        return catalog[0]
+    manufacturer = (manufacturer or "").strip()
+    product = (product or "").strip()
+    if manufacturer and product:
+        return "%s %s" % (manufacturer, product)
+    if product:
+        return product
+    if manufacturer:
+        return manufacturer
+    if vid is not None and pid is not None:
+        return "unknown USB-CAN, VID:PID %04x:%04x" % (vid, pid)
+    if iface:
+        return "SocketCAN %s" % iface
+    return "unknown USB-CAN"
+
+
+def _catalog(vid, pid):
+    if vid is None or pid is None:
+        return None
+    found = KNOWN_USB_CAN.get((vid, pid))
+    if found:
+        return found
+    if vid == 0x0C72:
+        return ("Peak USB-CAN", "peak")
+    if vid == 0x0BFD:
+        return ("Kvaser USB-CAN", "socketcan")
+    return None
+
+
+def _backend_for(driver, catalog, iface):
+    """A dongle the OS already shows as a CAN port is used that way. Otherwise the vendor library."""
+    if iface:
+        return "socketcan"
+    driver = (driver or "").lower()
+    if catalog:
+        return catalog[1]
+    if "peak" in driver or "pcan" in driver:
+        return "peak"
+    if "zlg" in driver or "controlcan" in driver:
+        return "zlg"
+    return "socketcan"
+
+
+def _usb_parent(start):
+    if not os.path.exists(start):
+        return ""
+    cur = os.path.realpath(start)
+    for _ in range(8):
+        if os.path.isfile(os.path.join(cur, "idVendor")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return ""
+
+
+def _driver_of(usb_node):
+    devices = os.path.dirname(usb_node)
+    base = os.path.basename(usb_node)
+    try:
+        names = os.listdir(devices)
+    except OSError:
+        return ""
+    for name in names:
+        if not name.startswith(base + ":"):
+            continue
+        link = os.path.join(devices, name, "driver")
+        if os.path.islink(link) or os.path.isdir(link):
+            return os.path.basename(os.path.realpath(link))
+    own = os.path.join(usb_node, "driver")
+    if os.path.islink(own) or os.path.isdir(own):
+        return os.path.basename(os.path.realpath(own))
+    return ""
+
+
+def _usb_record(node, iface, libs):
+    vid = _hex_id(_read_text(os.path.join(node, "idVendor")))
+    pid = _hex_id(_read_text(os.path.join(node, "idProduct")))
+    if vid is None or pid is None:
+        return None
+    catalog = _catalog(vid, pid)
+    driver = _driver_of(node)
+    backend = _backend_for(driver, catalog, iface)
+    lib_ready = (backend == "peak" and libs.get("peak")) or (backend == "zlg" and libs.get("zlg"))
+    ready = bool(iface) or lib_ready or bool(driver)
+    return {
+        "plain": plain_adapter_name(
+            _read_text(os.path.join(node, "manufacturer")),
+            _read_text(os.path.join(node, "product")),
+            vid, pid, iface, catalog,
+        ),
+        "backend": backend,
+        "iface": iface or "",
+        "vid": vid,
+        "pid": pid,
+        "driver": driver,
+        "ready": ready,
+    }
+
+
+def enumerate_adapters(sys_root="/sys", libs=None):
+    """List plugged-in CAN dongles. Does not open them and does not transmit."""
+    if libs is None:
+        libs = {"peak": bool(default_lib()), "zlg": bool(default_zlg_lib())}
+    found = []
+    seen = set()
+    net = os.path.join(sys_root, "class", "net")
+    if os.path.isdir(net):
+        for name in sorted(os.listdir(net)):
+            if _read_text(os.path.join(net, name, "type")) != "280":
+                continue
+            usb = _usb_parent(os.path.join(net, name, "device"))
+            if usb:
+                rec = _usb_record(usb, name, libs)
+                if rec:
+                    found.append(rec)
+                    seen.add(os.path.realpath(usb))
+                    continue
+            found.append({
+                "plain": "SocketCAN %s" % name,
+                "backend": "socketcan",
+                "iface": name,
+                "vid": None,
+                "pid": None,
+                "driver": "",
+                "ready": True,
+            })
+    usb_root = os.path.join(sys_root, "bus", "usb", "devices")
+    if os.path.isdir(usb_root):
+        for name in sorted(os.listdir(usb_root)):
+            node = os.path.join(usb_root, name)
+            if not os.path.isdir(node) or os.path.realpath(node) in seen:
+                continue
+            if not os.path.isfile(os.path.join(node, "idVendor")):
+                continue
+            vid = _hex_id(_read_text(os.path.join(node, "idVendor")))
+            pid = _hex_id(_read_text(os.path.join(node, "idProduct")))
+            driver = _driver_of(node)
+            catalog = _catalog(vid, pid)
+            looks_can = catalog or any(
+                bit in driver.lower() for bit in ("can", "peak", "pcan", "zlg", "gs_usb", "kvaser", "usbcan")
+            )
+            if not looks_can:
+                continue
+            rec = _usb_record(node, "", libs)
+            if rec:
+                found.append(rec)
+                seen.add(os.path.realpath(node))
+    return found
+
+
+def explain_failure(exc):
+    """Plain reason in the active language. Bitrate, bus power, missing driver, or ask versus write."""
+    text = str(exc)
+    low = text.lower()
+    boundary = any(pack.get("not_a_question") and pack["not_a_question"] in text for pack in COPY.values())
+    if boundary or "not a read-only" in low or "not a question" in low:
+        return t("plain_boundary")
+    if "bit/s" in low or "bitrate" in low or "kbit" in low:
+        return t("plain_bitrate")
+    if "library not found" in low or "driver is missing" in low or "driver" in low and "not found" in low:
+        return t("plain_driver")
+    if any(bit in low for bit in (
+        "network is down", "enetdown", "no such device", "opendevice", "no power",
+        "not open", "startcan", "initcan", "bus has no power",
+    )):
+        return t("plain_power")
+    return text
+
+
+def _is_uds_response(can_id):
+    """Vehicle replies: WH13 0x18DAF1xx, or J1979 0x7E8–0x7EF. Never a request id."""
+    n = can_id & 0x1FFFFFFF
+    return (n & 0xFFFFFF00) == 0x18DAF100 or (0x7E8 <= n <= 0x7EF)
+
+
+def decode_public(frames):
+    """Name traffic with the public J1939 list and standard UDS response names. No truck DBC."""
+    lines = []
+    uds_left = []
+    other = []
+    for fr in frames:
+        data = bytes(fr.get("data") or b"")
+        can_id = fr.get("id", 0) & 0x1FFFFFFF
+        if _is_uds_response(can_id):
+            uds_left.append((can_id, data))
+        else:
+            other.append(fr)
+    if other:
+        report = j1939_report(other).strip()
+        if report:
+            lines.append(report)
+    for can_id, data in uds_left:
+        if len(data) >= 2 and 1 <= data[0] <= 7 and len(data) >= 1 + data[0]:
+            payload = data[1:1 + data[0]]
+        else:
+            payload = data
+        if not payload:
+            continue
+        sid = payload[0]
+        if sid == 0x7F and len(payload) >= 3 and payload[2] == 0x33:
+            lines.append(t("response") % (can_id, t("uds_locked")))
+            continue
+        key = _UDS_NAME.get(sid)
+        if key:
+            lines.append(t("response") % (can_id, t(key)))
+        else:
+            lines.append(t("response_unknown") % (can_id, len(data)))
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+_DIAGNOSE_CSS = """
+:root{
+  --wr-page:#060f1e;--wr-card:#0d1f38;--wr-rail:#0a1a30;--wr-mast:#060f1e;--wr-mast-ink:#f0f4ff;
+  --wr-ink:#f0f4ff;--wr-ink-muted:#7a9abf;--wr-ink-faint:#5d7d9e;--wr-accent:#4a9eff;
+  --wr-accent-tint:rgba(74,158,255,.14);--wr-rule:rgba(74,158,255,.14);
+  --wr-rule-strong:rgba(74,158,255,.30);--wr-th:#102847;
+  --wr-warn:#3a2e19;--wr-warn-line:#e0a34a;--wr-warn-ink:#f3c98a;
+  --wr-note:#12263f;--wr-note-line:#4a9eff;--wr-note-ink:#c9dcf5;
+  --wr-ok:#143024;--wr-ok-line:#4ecfa0;--wr-ok-ink:#8fe3c4;
+  --wr-4:8px;--wr-5:12px;--wr-6:16px;--wr-7:24px;--wr-8:32px;
+  --wr-r-sm:4px;--wr-r:6px;--wr-r-lg:12px;--wr-r-pill:999px;
+  --wr-body:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue","PingFang SC","Hiragino Sans","Microsoft YaHei","Segoe UI",Roboto,"Noto Sans SC",Arial,sans-serif;
+  --wr-fs-sm:12px;--wr-fs-cap:13px;--wr-fs-body:15px;--wr-fs-lead:18px;--wr-fs-h1:38px;
+  --wr-maxw:1240px;
+}
+html{color-scheme:dark;background:var(--wr-page)}
+body.wr-page{margin:0;background:var(--wr-page);color:var(--wr-ink);font-family:var(--wr-body);font-size:var(--wr-fs-body);line-height:1.5}
+:lang(zh),:lang(ja),:lang(ko){letter-spacing:normal;text-transform:none}
+.wr-wrap{max-width:var(--wr-maxw);margin:0 auto;padding:var(--wr-7) var(--wr-6) 64px}
+.wr-mast{background:var(--wr-mast);color:var(--wr-mast-ink);border-bottom:1px solid var(--wr-rule)}
+.wr-mast .wr-wrap{padding-bottom:var(--wr-6)}
+.mast-row{display:flex;justify-content:space-between;align-items:flex-end;gap:var(--wr-6);flex-wrap:wrap}
+.wr-kicker{margin:0 0 6px;font-size:var(--wr-fs-sm);font-weight:600;color:var(--wr-ink-muted)}
+.wr-h1{margin:0;font-size:var(--wr-fs-h1);font-weight:600;line-height:1.15}
+.wr-chip{display:inline-block;padding:6px 12px;border-radius:var(--wr-r-pill);background:var(--wr-accent-tint);color:var(--wr-accent);font-size:var(--wr-fs-cap);font-weight:600}
+.wr-lead{font-size:var(--wr-fs-lead);color:var(--wr-ink-muted);margin:0 0 var(--wr-5);max-width:46rem}
+.wr-callout{border-left:3px solid;border-radius:var(--wr-r-sm);padding:var(--wr-4) var(--wr-5);margin:var(--wr-5) 0 var(--wr-6);font-size:var(--wr-fs-cap)}
+.wr-warn{background:var(--wr-warn);border-color:var(--wr-warn-line);color:var(--wr-warn-ink)}
+.wr-note{background:var(--wr-note);border-color:var(--wr-note-line);color:var(--wr-note-ink)}
+.wr-ok{background:var(--wr-ok);border-color:var(--wr-ok-line);color:var(--wr-ok-ink)}
+.wr-callout strong{display:block;font-size:var(--wr-fs-sm);font-weight:600;margin-bottom:2px}
+.wr-sec{background:var(--wr-card);border:1px solid var(--wr-rule);border-left:3px solid var(--wr-accent);border-radius:var(--wr-r-lg);margin:var(--wr-5) 0}
+.wr-sec>summary{cursor:pointer;list-style:none;padding:var(--wr-5) var(--wr-6);display:flex;gap:var(--wr-5);align-items:baseline;flex-wrap:wrap}
+.wr-sec>summary::-webkit-details-marker{display:none}
+.wr-sec>summary::before{content:"▸";color:var(--wr-accent);font-size:var(--wr-fs-sm);display:inline-block;transition:transform .15s ease}
+.wr-sec[open]>summary::before{transform:rotate(90deg)}
+[dir=rtl] .wr-sec>summary::before{content:"◂"}
+[dir=rtl] .wr-sec[open]>summary::before{transform:rotate(-90deg)}
+.wr-sec>summary:hover{background:var(--wr-rail)}
+.wr-sec>.wr-body{padding:var(--wr-5) var(--wr-6) var(--wr-6);border-top:1px solid var(--wr-rule)}
+.wr-sec-n{color:var(--wr-accent);font-weight:600;font-size:var(--wr-fs-cap)}
+.wr-sec-t{font-weight:600;font-size:var(--wr-fs-lead);color:var(--wr-ink)}
+.wr-sec-f{color:var(--wr-ink-muted);font-size:var(--wr-fs-cap)}
+.wr-muted{color:var(--wr-ink-muted)}
+.wr-goals{display:flex;flex-wrap:wrap;gap:var(--wr-4);margin-top:var(--wr-5)}
+.wr-btn{font-family:var(--wr-body);font-size:var(--wr-fs-cap);cursor:pointer;padding:8px 14px;border-radius:var(--wr-r-pill);border:1px solid var(--wr-rule-strong);background:transparent;color:var(--wr-ink)}
+.wr-btn[aria-pressed="true"]{background:var(--wr-accent);border-color:var(--wr-accent);color:#fff;font-weight:600}
+.wr-btn:focus-visible{outline:2px solid var(--wr-accent);outline-offset:2px}
+.wr-sub{font-size:var(--wr-fs-body);font-weight:600;margin:var(--wr-6) 0 var(--wr-4);color:var(--wr-ink)}
+.wr-fig-scroll{overflow-x:auto}
+.wr-table{border-collapse:collapse;width:100%;font-size:var(--wr-fs-cap)}
+.wr-table th{background:var(--wr-th);font-weight:600;font-size:var(--wr-fs-sm);color:var(--wr-ink-muted)}
+.wr-table th,.wr-table td{border:1px solid var(--wr-rule-strong);padding:6px 8px;text-align:start;vertical-align:top}
+.wr-table td.wr-n{font-variant-numeric:tabular-nums;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.wr-table tr.is-hot td{background:rgba(74,158,255,.16)}
+.wr-foot{color:var(--wr-ink-faint);font-size:var(--wr-fs-cap);margin-top:var(--wr-8)}
+@media(max-width:640px){
+  :root{--wr-fs-h1:28px}
+  .wr-wrap{padding:var(--wr-6) var(--wr-5) 48px}
+}
+"""
+
+_DIAGNOSE_JS = """
+(function () {
+  var buttons = document.querySelectorAll("button.wr-btn[data-goal]");
+  function paint() {
+    var on = {}, any = false;
+    buttons.forEach(function (b) {
+      if (b.getAttribute("aria-pressed") === "true") { on[b.getAttribute("data-goal")] = true; any = true; }
+    });
+    document.querySelectorAll("tr[data-goal]").forEach(function (row) {
+      var goal = row.getAttribute("data-goal");
+      var show = !any || !goal || !!on[goal];
+      row.hidden = !show;
+      if (any && goal && on[goal]) row.classList.add("is-hot");
+      else row.classList.remove("is-hot");
+    });
+    var box = document.getElementById("results");
+    if (box && any) box.open = true;
+  }
+  buttons.forEach(function (b) {
+    b.addEventListener("click", function () {
+      var was = b.getAttribute("aria-pressed") === "true";
+      buttons.forEach(function (other) { other.setAttribute("aria-pressed", "false"); });
+      b.setAttribute("aria-pressed", was ? "false" : "true");
+      paint();
+    });
+  });
+})();
+"""
+
+_GOAL_KEY = {
+    "session": "goal_session",
+    "present": "goal_present",
+    "vin": "goal_vin",
+    "faults": "goal_faults",
+}
+
+
+def _esc(value):
+    return html.escape("" if value is None else str(value), quote=True)
+
+
+def _frame_parts(frame):
+    """(id, data) from a send tuple or a listen dict."""
+    if isinstance(frame, dict):
+        can_id = int(frame.get("id") or 0)
+        data = frame.get("data") or b""
+    else:
+        can_id = int(frame[0])
+        data = frame[1]
+    if isinstance(data, str):
+        data = data.encode("latin1")
+    else:
+        data = bytes(bytearray(data))
+    return can_id & 0x1FFFFFFF, data
+
+
+def _goal_of(data):
+    if not data:
+        return ""
+    sid = data[0]
+    if len(data) >= 2 and 1 <= data[0] <= 7:
+        sid = data[1]
+    if sid == 0x7F and len(data) >= 3:
+        sid = data[2] if 1 <= data[0] <= 7 else data[1]
+    return {
+        0x10: "session", 0x50: "session",
+        0x3E: "present", 0x7E: "present",
+        0x22: "vin", 0x62: "vin",
+        0x19: "faults", 0x59: "faults",
+    }.get(sid, "")
+
+
+def _ask_hex(data):
+    if data and 1 <= (data[0] & 0x0F) <= 7:
+        count = 1 + (data[0] & 0x0F)
+    else:
+        count = len(data)
+    return " ".join("%02X" % (byte & 0xFF) for byte in data[:count])
+
+
+def _after_label(line):
+    for sep in (": ", "："):
+        if sep in line:
+            return line.split(sep, 1)[1].strip().rstrip("。.")
+    return line.strip().rstrip("。.")
+
+
+def _clip(text, limit=96):
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _asked_rows(frames):
+    rows = []
+    for frame in frames or []:
+        can_id, data = _frame_parts(frame)
+        goal = _goal_of(data)
+        what = t(_GOAL_KEY[goal]) if goal in _GOAL_KEY else t("col_ask")
+        rows.append((goal, what, "0x%X" % can_id, _ask_hex(data)))
+    return rows
+
+
+def _heard_rows(frames):
+    rows = []
+    for frame in frames or []:
+        can_id, data = _frame_parts(frame)
+        raw = decode_public([{"id": can_id, "data": data, "ext": can_id > 0x7FF}]).strip()
+        if not raw:
+            continue
+        if _is_uds_response(can_id):
+            label = _after_label(raw.splitlines()[0])
+        else:
+            label = " ".join(raw.split())
+        rows.append((_goal_of(data), "0x%X" % can_id, label))
+    return rows
+
+
+def _page_status(found, lines, asked):
+    blob = "\n".join(line or "" for line in (lines or []))
+    for key in ("plain_boundary", "plain_driver", "plain_bitrate", "plain_power"):
+        sentence = t(key)
+        if sentence and sentence in blob:
+            return "warn", sentence
+    if asked:
+        return "ok", t("status_asked")
+    ready = [dev for dev in (found or []) if dev.get("ready")]
+    if ready:
+        prefix = t("found").split("%s")[0]
+        for line in reversed(lines or []):
+            text = line or ""
+            if text and text != t("ask_only") and prefix not in text:
+                return "warn", text
+        return "ok", t("status_ready")
+    if found:
+        return "warn", t("status_driver")
+    return "note", t("plain_nothing")
+
+
+def _dev_plain(dev):
+    return (dev or {}).get("plain") or "unknown USB-CAN"
+
+
+def _section(num, title, finding, inner, ident=""):
+    open_id = (' id="%s"' % ident) if ident else ""
+    head = (
+        '<details class="wr-sec" open%s><summary>'
+        '<span class="wr-sec-n">%s</span>'
+        '<span class="wr-sec-t">%s</span>'
+        '<span class="wr-sec-f">%s</span></summary><div class="wr-body">'
+    ) % (open_id, _esc(num), _esc(title), _esc(finding))
+    return head + inner + "</div></details>"
+
+
+def _goal_buttons():
+    buttons = []
+    for goal in ("session", "present", "vin", "faults"):
+        buttons.append(
+            '<button type="button" class="wr-btn" data-goal="%s" aria-pressed="false">%s</button>'
+            % (goal, _esc(t(_GOAL_KEY[goal])))
+        )
+    return '<div class="wr-goals">%s</div>' % "".join(buttons)
+
+
+def _rows_table(headers, rows, mono=()):
+    head = "".join("<th>%s</th>" % _esc(cell) for cell in headers)
+    body = []
+    for row in rows:
+        goal = row[0]
+        cells = []
+        for i, cell in enumerate(row[1:]):
+            cls = ' class="wr-n"' if i in mono else ""
+            cells.append("<td%s>%s</td>" % (cls, _esc(cell)))
+        body.append('<tr data-goal="%s">%s</tr>' % (goal, "".join(cells)))
+    return (
+        '<div class="wr-fig-scroll"><table class="wr-table"><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
+        % (head, "".join(body))
+    )
+
+
+def connect_html(found, lines, asked=None, heard=None):
+    """Full Diagnose page. A goal button only highlights a row. It does not transmit."""
+    tag, direction = html_locale()
+    kind, sentence = _page_status(found, lines, asked)
+    asked_rows = _asked_rows(asked)
+    heard_rows = _heard_rows(heard)
+    want = "<p>%s</p>%s" % (_esc(t("step_want_body")), _goal_buttons())
+    want_find = " · ".join(t(key) for key in ("goal_session", "goal_vin", "goal_faults"))
+    adapter = ["<p>%s</p>" % _esc(t("plug_brand")), "<p>%s</p>" % _esc(t("step_adapter_body"))]
+    if found:
+        adapter.append(_rows_table(
+            (t("col_name"), t("col_state")),
+            [("", _dev_plain(dev), t("status_ready") if dev.get("ready") else t("status_driver")) for dev in found],
+        ))
+        adapter_find = ", ".join(_dev_plain(dev) for dev in found)
+    else:
+        adapter.append("<p>%s</p>" % _esc(t("plain_nothing")))
+        adapter_find = t("status_none")
+    bus = "<p>%s</p>%s" % (
+        _esc(t("step_bus_body")),
+        _rows_table(
+            (t("col_what"), t("col_result")),
+            [
+                ("", t("bus_where"), t("bus_where_val")),
+                ("", t("bus_kind"), t("bus_kind_val")),
+                ("", t("bus_ask"), t("bus_ask_val")),
+                ("", t("bus_never"), t("bus_never_val")),
+            ],
+        ),
+    )
+    results = ["<p>%s</p>" % _esc(t("step_results_body")), "<h2 class=\"wr-sub\">%s</h2>" % _esc(t("results_asked"))]
+    if asked_rows:
+        results.append(_rows_table((t("col_what"), t("col_id"), t("col_ask")), asked_rows, mono=(1, 2)))
+    else:
+        results.append('<p class="wr-muted">%s</p>' % _esc(t("result_waiting")))
+    results.append("<h2 class=\"wr-sub\">%s</h2>" % _esc(t("results_heard")))
+    if heard_rows:
+        results.append(_rows_table((t("col_id"), t("col_result")), [
+            (goal, ident, label) for goal, ident, label in heard_rows
+        ], mono=(0,)))
+        result_find = _clip(" · ".join(label for _goal, _ident, label in heard_rows[:3]))
+    else:
+        results.append('<p class="wr-muted">%s</p>' % _esc(t("result_none")))
+        result_find = t("result_none") if asked_rows else t("result_waiting")
+    parts = [
+        '<!DOCTYPE html><html lang="%s" dir="%s"><head><meta charset="utf-8">' % (_esc(tag), direction),
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        "<title>%s</title><style>" % _esc(t("page_kicker") + " " + t("page_title")),
+        _DIAGNOSE_CSS,
+        '</style></head><body class="wr-page">',
+        '<header class="wr-mast"><div class="wr-wrap mast-row"><div>',
+        '<p class="wr-kicker">%s</p>' % _esc(t("page_kicker")),
+        '<h1 class="wr-h1">%s</h1></div>' % _esc(t("page_title")),
+        '<p class="wr-chip">%s</p></div></header>' % _esc(t("ask_only")),
+        '<main class="wr-wrap">',
+        '<p class="wr-lead">%s</p>' % _esc(t("page_lead")),
+        '<div class="wr-callout wr-%s" role="status"><strong>%s</strong>%s</div>' % (
+            kind, _esc(t("status_label")), _esc(sentence),
+        ),
+        _section("1", t("step_want"), want_find, want, "want"),
+        _section("2", t("step_adapter"), _clip(adapter_find), "".join(adapter), "adapter"),
+        _section("3", t("step_bus"), t("bus_kind_val"), bus, "bus"),
+        _section("4", t("step_results"), result_find, "".join(results), "results"),
+        '<p class="wr-foot">%s</p></main><script>' % _esc(t("page_foot")),
+        _DIAGNOSE_JS,
+        "</script></body></html>",
+    ]
+    return "".join(parts)
+
+
+def run_connect(found=None, open_port=None, libs=None):
+    """Enumerate, name, and when a dongle is ready ask read-only UDS at classic 500 kbit/s."""
+    if found is None:
+        found = enumerate_adapters(libs=libs)
+    lines = [t("ask_only")]
+    asked = []
+    heard = []
+    if not found:
+        lines.append(t("plain_nothing"))
+        return {"ok": False, "found": found, "lines": lines, "asked": asked, "heard": heard}
+    lines.append(t("found") % "; ".join(dev["plain"] for dev in found))
+    ready = [dev for dev in found if dev.get("ready")]
+    if not ready:
+        lines.append(t("plain_driver"))
+        return {"ok": False, "found": found, "lines": lines, "asked": asked, "heard": heard}
+    if open_port is None:
+        open_port = open_can_port
+    last = None
+    for dev in ready:
+        port = None
+        try:
+            port = open_port(dev.get("backend") or "auto", iface=dev.get("iface") or "")
+            port.open_transmit(classic=True, bitrate=DIAGNOSTIC_BITRATE)
+            poll = uds_read_frames("extended")
+            for can_id, data, ext in poll:
+                port.send(can_id, data, extended=ext)
+                asked.append((can_id, bytes(data), ext))
+            if hasattr(port, "read_frames"):
+                heard = list(port.read_frames(0.05) or [])
+            lines.append(t("asked") % dev["plain"])
+            if heard:
+                lines.append(t("heard"))
+                text = decode_public(heard).strip()
+                if text:
+                    lines.append(text)
+            else:
+                lines.append(t("quiet_bus"))
+            return {"ok": True, "found": found, "lines": lines, "asked": asked, "heard": heard}
+        except Fail as exc:
+            last = exc
+            lines.append("%s: %s" % (dev["plain"], explain_failure(exc)))
+        finally:
+            if port is not None:
+                port.close()
+    plain = (t("plain_driver"), t("plain_bitrate"), t("plain_power"), t("plain_boundary"))
+    if last is not None and not any(sentence in lines[-1] for sentence in plain):
+        lines.append(explain_failure(last))
+    return {"ok": False, "found": found, "lines": lines, "asked": asked, "heard": heard}
 
 
 def _keys(name):
@@ -921,29 +2174,52 @@ def _cmd_send(argv):
         raise Fail("A question is sent once.")
     if _opt(argv, "--count") not in (None, "1"):
         raise Fail("A question is sent once.")
-    classic = _flag(argv, "--classic")
-    bitrate = int(_opt(argv, "--bitrate", "500000"))
+    uds = _flag(argv, "--uds")
+    classic = _flag(argv, "--classic") or uds
+    bitrate = int(_opt(argv, "--bitrate", str(DIAGNOSTIC_BITRATE)))
     frames = []
-    j1939_ask = _opt(argv, "--j1939")
-    if j1939_ask is not None:
-        if _opt(argv, "--id") or _opt(argv, "--list"):
-            raise Fail("send --j1939 asks for one parameter group only.")
-        frames.append(j1939_request_frame(j1939_ask))
-    if _opt(argv, "--list"):
-        frames.extend(_load_list(_opt(argv, "--list")))
-    if _opt(argv, "--id"):
-        ident = _opt(argv, "--id")
-        data = _parse_data(_opt(argv, "--data", ""))
-        ext = _flag(argv, "--extended") or len(ident) > 3
-        frames.append((int(ident, 16), data, ext))
+    if uds:
+        if _opt(argv, "--j1939") is not None or _opt(argv, "--list") or _opt(argv, "--id") or _opt(argv, "--data"):
+            raise Fail("send --uds is only the read-only UDS poll.")
+        if bitrate != DIAGNOSTIC_BITRATE:
+            raise Fail("Diagnostic CAN is classic %d bit/s (OBD pins 6 and 14)." % DIAGNOSTIC_BITRATE)
+        target = _parse_target(_opt(argv, "--target")) if _opt(argv, "--target") is not None else None
+        frames.extend(uds_read_frames(_opt(argv, "--session", "extended"), target))
+    else:
+        if _opt(argv, "--session") is not None or _opt(argv, "--target") is not None:
+            raise Fail("--session and --target are only valid with send --uds.")
+        j1939_ask = _opt(argv, "--j1939")
+        if j1939_ask is not None:
+            if _opt(argv, "--id") or _opt(argv, "--list"):
+                raise Fail("send --j1939 asks for one parameter group only.")
+            frames.append(j1939_request_frame(j1939_ask))
+        if _opt(argv, "--list"):
+            frames.extend(_load_list(_opt(argv, "--list")))
+        if _opt(argv, "--id"):
+            ident = _opt(argv, "--id")
+            data = _parse_data(_opt(argv, "--data", ""))
+            ext = _flag(argv, "--extended") or len(ident) > 3
+            frames.append((int(ident, 16), data, ext))
     if not frames:
         frames = standard_questions()
     for can_id, data, ext in frames:
         if not is_inquiry(can_id, data, ext):
-            raise Fail(NOT_A_QUESTION)
+            raise Fail(t("not_a_question"))
+        if _uds_ask_frame(data) and (not classic or bitrate != DIAGNOSTIC_BITRATE):
+            raise Fail(t("uds_bus"))
     fd = False
-    print(BUS_NOTE)
-    bus = PeakBus(lib_path=_opt(argv, "--lib", ""))
+    print(t("bus_note"))
+    if any(_uds_ask_frame(data) for _can_id, data, _ext in frames):
+        print(t("uds_bus"))
+    bus = open_can_port(
+        _opt(argv, "--adapter", "auto"),
+        lib_path=_opt(argv, "--lib", ""),
+        iface=_opt(argv, "--iface", ""),
+        dev_type=int(_opt(argv, "--dev-type", "4"), 0),
+        dev_index=int(_opt(argv, "--dev-index", "0"), 0),
+        channel=int(_opt(argv, "--channel", "0"), 0),
+    )
+    print("%s: %s" % (ADAPTER_LABEL, bus.name))
     bus.open_transmit(classic=classic, bitrate=bitrate)
     try:
         for can_id, data, ext in frames:
@@ -954,15 +2230,73 @@ def _cmd_send(argv):
     return 0
 
 
+def _cmd_connect(argv):
+    report = run_connect()
+    for line in report["lines"]:
+        print(line)
+    page = _opt(argv, "--page")
+    if page:
+        with open(page, "w", encoding="utf-8") as handle:
+            handle.write(connect_html(
+                report["found"], report["lines"], report.get("asked"), report.get("heard"),
+            ))
+        print(page)
+    if report["ok"] or not any(dev.get("ready") for dev in report["found"]):
+        return 0
+    return 2
+
+
+def _pull_lang(argv):
+    """--lang wins over WR_LANG. Unknown codes become English, same as the site."""
+    out = []
+    chosen = None
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("--lang", "-lang"):
+            if i + 1 >= len(argv):
+                raise Fail("missing value after %s" % argv[i])
+            chosen = argv[i + 1]
+            i += 2
+            continue
+        out.append(argv[i])
+        i += 1
+    if chosen is not None:
+        set_lang(chosen)
+    return out
+
+
 def main(argv):
+    try:
+        argv = _pull_lang(list(argv))
+    except Fail as exc:
+        sys.stderr.write(str(exc) + "\n")
+        return 2
     if not argv or argv[0] in ("-h", "--help", "help"):
+        print(t("ask_only"))
+        print(t("help_plug"))
+        print(t("help_brand"))
+        print(t("help_lang"))
+        print(ADAPTER_LABEL)
+        found = enumerate_adapters()
+        if found:
+            print(t("plugged_in") % "; ".join(dev["plain"] for dev in found))
+        else:
+            print(t("plain_nothing"))
         print("plot FILE.asc [--dbc FILE]")
         print("j1939 FILE.asc")
         print("decode FILE.asc [--dbc FILE]")
         print("dbc set FILE.dbc")
-        print("send    ask the standard questions (speed, fault codes, VIN)")
-        print("send --id 7DF --data 02 01 0D    one read request; writes are refused")
+        print("send    ask the standard J1979 questions (speed, fault codes, VIN)")
+        print("connect    find the dongle and ask read-only UDS on 0x18DBFFF1")
+        print("send --uds    WH13 UDS poll on 29-bit 0x18DBFFF1 (classic 500 kbit/s)")
+        print("send --uds --adapter socketcan --iface can0")
+        print("send --uds --adapter zlg    ZLG ControlCAN, classic 500 kbit/s")
+        print("send --uds --target 10    same poll, physical 0x18DA10F1")
+        print("send --id 18DBFFF1 --data 02 10 03 --classic    extended session, a read")
+        print("send --id 7DF --data 02 01 0D    J1979 legacy read; UDS is not sent on 7DF")
         print("send --j1939 dm1    ask one read-only J1939 group; DM3 and DM11 are refused")
+        print("Refused: programming session, flash ($34/$36/$37), write ($2E),")
+        print("IO control ($2F), routine control ($31), security access ($27).")
         print("Recording stays listen-only. CAN XL is not implemented.")
         return 0
     cmd, rest = argv[0], argv[1:]
@@ -977,6 +2311,8 @@ def main(argv):
             return _cmd_dbc(rest)
         if cmd == "send":
             return _cmd_send(rest)
+        if cmd == "connect":
+            return _cmd_connect(rest)
         raise Fail("unknown command: %s" % cmd)
     except Fail as exc:
         sys.stderr.write(str(exc) + "\n")
